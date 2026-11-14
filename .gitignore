@@ -1,0 +1,36 @@
+# Secrets and local config: never in the repo.
+.env
+.env.*
+providers.json
+config.local.json
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+
+# Models and engines: downloaded on the user's machine, not shipped.
+models/
+engines/
+fastsd-cpu/
+sd.cpp/
+*.gguf
+*.onnx
+*.onnx.json
+*.safetensors
+
+# Python and install artifacts.
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+
+# Local runs, logs, and results.
+*.log
+results/
+*.zip
+HicksField/

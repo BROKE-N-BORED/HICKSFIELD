@@ -1,0 +1,144 @@
+import subprocess
+import unittest
+
+from hicksfield import video
+from hicksfield.errors import FFmpegMissingError, HicksFieldError
+from tests.helpers import TempEnvTestCase, write_png
+
+
+def _has_ffmpeg():
+    return video.find_ffmpeg() is not None
+
+
+def _has_subtitles_filter():
+    ffmpeg = video.find_ffmpeg()
+    if ffmpeg is None:
+        return False
+    proc = subprocess.run([str(ffmpeg), "-hide_banner", "-filters"],
+                          capture_output=True, text=True, timeout=30)
+    return " subtitles " in proc.stdout
+
+
+class VideoPureTests(unittest.TestCase):
+    def test_motion_cycles(self):
+        self.assertEqual(video.motion_for_scene(0), "zoomin")
+        self.assertEqual(video.motion_for_scene(1), "zoomout")
+        self.assertEqual(video.motion_for_scene(2), "panleft")
+        self.assertEqual(video.motion_for_scene(3), "panright")
+        self.assertEqual(video.motion_for_scene(4), "zoomin")
+
+    def test_zoompan_filter(self):
+        filt = video.zoompan_filter("zoomin", 5)
+        self.assertIn("zoompan", filt)
+        self.assertIn("fps=30", filt)
+        self.assertIn("s=1280x720", filt)
+        self.assertIn("d=150", filt)
+        self.assertIn("min(zoom+", video.zoompan_filter("zoomin", 5))
+        self.assertIn("max(", video.zoompan_filter("zoomout", 5))
+        self.assertIn("1-on/", video.zoompan_filter("panleft", 5))
+        self.assertIn("on/", video.zoompan_filter("panright", 5))
+
+    def test_scene_filter_scales_then_moves(self):
+        filt = video.build_scene_filter("zoomin", 5)
+        self.assertIn("scale=1920:1080", filt)
+        self.assertIn("crop=1920:1080", filt)
+        self.assertIn("zoompan", filt)
+
+    def test_format_srt_time(self):
+        self.assertEqual(video.format_srt_time(0), "00:00:00,000")
+        self.assertEqual(video.format_srt_time(61.5), "00:01:01,500")
+        self.assertEqual(video.format_srt_time(3661.25), "01:01:01,250")
+
+    def test_write_srt(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "film.srt"
+            video.write_srt([(0, 3, "First line"), (3, 6, "Second line")],
+                            path)
+            text = path.read_text(encoding="utf-8")
+        self.assertIn("1\n00:00:00,000 --> 00:00:03,000\nFirst line",
+                      text)
+        self.assertIn("2\n00:00:03,000 --> 00:00:06,000\nSecond line",
+                      text)
+
+
+class VideoFFmpegTests(TempEnvTestCase):
+    def setUp(self):
+        super().setUp()
+        if not _has_ffmpeg():
+            self.skipTest("ffmpeg not installed")
+        self.still = write_png(self.tmp / "still.png")
+
+    def test_make_scene_clip(self):
+        clip = self.tmp / "clip.mp4"
+        video.make_scene_clip(self.still, clip, 1, "zoomin")
+        self.assertTrue(clip.exists())
+        self.assertGreater(clip.stat().st_size, 0)
+        duration = video.probe_duration(clip)
+        if duration is not None:
+            self.assertAlmostEqual(duration, 1.0, delta=0.2)
+
+    def test_make_scene_clip_with_audio(self):
+        from tests.helpers import write_wav
+        audio = write_wav(self.tmp / "line.wav", seconds=1.0)
+        clip = self.tmp / "clip.mp4"
+        video.make_scene_clip(self.still, clip, 3, "panleft",
+                              audio_path=audio)
+        self.assertTrue(clip.exists())
+        duration = video.probe_duration(clip)
+        if duration is not None:
+            self.assertAlmostEqual(duration, 3.0, delta=0.3)
+
+    def test_assemble_two_clips(self):
+        clip1 = self.tmp / "c1.mp4"
+        clip2 = self.tmp / "c2.mp4"
+        video.make_scene_clip(self.still, clip1, 1, "zoomin")
+        video.make_scene_clip(self.still, clip2, 1, "zoomout")
+        film = self.tmp / "film.mp4"
+        video.assemble([clip1, clip2], film, total_seconds=2)
+        self.assertTrue(film.exists())
+        duration = video.probe_duration(film)
+        if duration is not None:
+            self.assertAlmostEqual(duration, 2.0, delta=0.3)
+
+    def test_assemble_with_burned_captions(self):
+        if not _has_subtitles_filter():
+            self.skipTest("ffmpeg has no subtitles filter")
+        font = video.find_caption_font()
+        if font is None:
+            self.skipTest("no caption font on this machine")
+        clip = self.tmp / "c1.mp4"
+        video.make_scene_clip(self.still, clip, 1, "zoomin")
+        srt = self.tmp / "film.srt"
+        video.write_srt([(0, 1, "Hello film")], srt)
+        film = self.tmp / "film.mp4"
+        video.assemble([clip], film, srt_path=srt, font_path=font,
+                       total_seconds=1)
+        self.assertTrue(film.exists())
+
+    def test_ffmpeg_failure_is_plain(self):
+        with self.assertRaises(HicksFieldError):
+            video.run_ffmpeg(
+                [str(video.find_ffmpeg()), "-y", "-i",
+                 str(self.tmp / "missing.png"),
+                 str(self.tmp / "out.mp4")],
+                total_seconds=1)
+
+    def test_require_ffmpeg(self):
+        # ffmpeg exists here, so this must not raise.
+        video.require_ffmpeg()
+        self.assertIsNotNone(video.ffmpeg_version())
+        self.assertTrue(video.ffmpeg_version().startswith("ffmpeg"))
+
+
+class VideoMissingTests(unittest.TestCase):
+    def test_require_ffmpeg_raises_when_missing(self):
+        import unittest.mock as mock
+        with mock.patch.object(video, "find_ffmpeg", return_value=None):
+            with self.assertRaises(FFmpegMissingError):
+                video.require_ffmpeg()
+
+
+if __name__ == "__main__":
+    unittest.main()

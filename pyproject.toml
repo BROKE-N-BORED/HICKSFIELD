@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hicksfield"
+version = "0.2.0"
+description = "HicksField: a free local film studio for Linux. Type an idea, get a short film."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Broke n' Bored Studio"}]
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.scripts]
+hicksfield = "hicksfield.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["hicksfield*"]
