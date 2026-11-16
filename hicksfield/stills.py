@@ -12,6 +12,7 @@ anything without being asked.
 
 import hashlib
 import json
+import logging
 import os
 import random
 import shutil
@@ -32,6 +33,8 @@ from hicksfield.errors import (
     HicksFieldError,
 )
 from hicksfield.steps import run_steps
+
+logger = logging.getLogger("hicksfield.stills")
 
 STILL_SIZE = 512
 PER_IMAGE_TIMEOUT_S = 1800
@@ -425,7 +428,8 @@ class FastSDCPUEngine(StillEngine):
         if proc.returncode != 0 or not self.cli_python.exists():
             raise HicksFieldError(
                 "Could not make a home for the stills engine.",
-                "Install it with: sudo apt install python3.12-venv",
+                "Run the HicksField installer again. It installs the "
+                "Python venv package for you.",
             )
         progress(1.0, "")
 
@@ -540,6 +544,7 @@ class FastSDCPUEngine(StillEngine):
                 f"The fast stills engine is not ready: {status}",
                 "Set it up from the Stills window first.",
             )
+        logger.info("Making a picture with %s", self.label)
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         before = self._snapshot_results()
@@ -603,6 +608,7 @@ class FastSDCPUEngine(StillEngine):
                 "Try again.",
             )
         shutil.copyfile(newest, out_path)
+        logger.info("Picture made with %s", self.label)
         return out_path
 
 
@@ -810,6 +816,7 @@ class SDCppEngine(StillEngine):
                 f"The steady stills engine is not ready: {status}",
                 "Set it up from the Stills window first.",
             )
+        logger.info("Making a picture with %s", self.label)
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         if seed < 0:
@@ -829,6 +836,7 @@ class SDCppEngine(StillEngine):
                 "The stills engine finished but no picture appeared.",
                 f"Last lines: {tail}" if tail else "Try again.",
             )
+        logger.info("Picture made with %s", self.label)
         return out_path
 
 

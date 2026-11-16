@@ -1,5 +1,6 @@
 import subprocess
 import unittest
+from unittest import mock
 
 from hicksfield import video
 from hicksfield.errors import FFmpegMissingError, HicksFieldError
@@ -79,6 +80,15 @@ class VideoFFmpegTests(TempEnvTestCase):
         if duration is not None:
             self.assertAlmostEqual(duration, 1.0, delta=0.2)
 
+    def test_make_scene_clip_still(self):
+        clip = self.tmp / "clip-still.mp4"
+        video.make_scene_clip(self.still, clip, 1, "still")
+        self.assertTrue(clip.exists())
+        self.assertGreater(clip.stat().st_size, 0)
+        duration = video.probe_duration(clip)
+        if duration is not None:
+            self.assertAlmostEqual(duration, 1.0, delta=0.2)
+
     def test_make_scene_clip_with_audio(self):
         from tests.helpers import write_wav
         audio = write_wav(self.tmp / "line.wav", seconds=1.0)
@@ -134,10 +144,79 @@ class VideoFFmpegTests(TempEnvTestCase):
 
 class VideoMissingTests(unittest.TestCase):
     def test_require_ffmpeg_raises_when_missing(self):
-        import unittest.mock as mock
         with mock.patch.object(video, "find_ffmpeg", return_value=None):
             with self.assertRaises(FFmpegMissingError):
                 video.require_ffmpeg()
+
+
+class MotionChoiceTests(unittest.TestCase):
+    """Item 13: a scene's own camera move wins over the rotation."""
+
+    def test_chosen_move_wins(self):
+        self.assertEqual(video.motion_for_scene(0, "panleft"),
+                         "panleft")
+        self.assertEqual(video.motion_for_scene(1, "still"), "still")
+        self.assertEqual(video.motion_for_scene(2, "zoomout"),
+                         "zoomout")
+        self.assertEqual(video.motion_for_scene(3, "panright"),
+                         "panright")
+
+    def test_auto_and_empty_rotate_by_scene_number(self):
+        self.assertEqual(video.motion_for_scene(0, ""), "zoomin")
+        self.assertEqual(video.motion_for_scene(1, ""), "zoomout")
+        self.assertEqual(video.motion_for_scene(0, "auto"), "zoomin")
+        self.assertEqual(video.motion_for_scene(3, "auto"), "panright")
+        self.assertEqual(video.motion_for_scene(4, "auto"), "zoomin")
+
+    def test_unknown_move_falls_back_to_rotation(self):
+        self.assertEqual(video.motion_for_scene(0, "spin"), "zoomin")
+        self.assertEqual(video.motion_for_scene(2, "spin"), "panleft")
+
+    def test_still_filter_holds_the_frame(self):
+        filt = video.zoompan_filter("still", 5)
+        self.assertIn("zoompan", filt)
+        self.assertIn("z='1.0'", filt)
+        self.assertNotIn("on/", filt)
+        self.assertNotIn("zoom+", filt)
+
+
+class PosterTests(TempEnvTestCase):
+    """Item 14: the first frame, taken with ffmpeg."""
+
+    def setUp(self):
+        super().setUp()
+        if not _has_ffmpeg():
+            self.skipTest("ffmpeg not installed")
+        self.still = write_png(self.tmp / "still.png")
+        self.film = self.tmp / "film.mp4"
+        video.make_scene_clip(self.still, self.film, 1, "zoomin")
+
+    def test_extract_first_frame(self):
+        out = self.tmp / "poster.png"
+        result = video.extract_first_frame(self.film, out)
+        self.assertEqual(result, out)
+        self.assertTrue(out.exists())
+        self.assertGreater(out.stat().st_size, 0)
+        self.assertEqual(out.read_bytes()[:8],
+                         b"\x89PNG\r\n\x1a\n")
+
+    def test_extract_first_frame_missing_film_returns_none(self):
+        out = self.tmp / "poster.png"
+        self.assertIsNone(video.extract_first_frame(
+            self.tmp / "nope.mp4", out))
+        self.assertFalse(out.exists())
+
+    def test_extract_first_frame_broken_film_returns_none(self):
+        broken = self.tmp / "broken.mp4"
+        broken.write_bytes(b"not a film")
+        out = self.tmp / "poster.png"
+        self.assertIsNone(video.extract_first_frame(broken, out))
+
+    def test_extract_first_frame_without_ffmpeg_returns_none(self):
+        with mock.patch.object(video, "find_ffmpeg",
+                               return_value=None):
+            self.assertIsNone(video.extract_first_frame(
+                self.film, self.tmp / "poster.png"))
 
 
 if __name__ == "__main__":

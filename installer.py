@@ -3,9 +3,11 @@
 
 Double-click for the window, or run `python3 installer.py --text`
 (or install.sh) for the terminal version. Both run the same install:
-copy the app into ~/.local/share/hicksfield-app, make a venv, install
-PySide6, render the icons from the SVG source, write the app-menu
-entry, and verify the install works before reporting success.
+install ffmpeg and the Python venv package first (one permission
+window asks for the password), then copy the app into
+~/.local/share/hicksfield-app, make a venv, install PySide6, render
+the icons from the SVG source, write the app-menu entry, and verify
+the install works before reporting success.
 
 Engines and voices are NOT set up here. The app sets them up in its
 own windows, with real progress and cancel, the first time they are
@@ -22,6 +24,10 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+
+# sysdeps uses only the standard library, so it is safe to import
+# before the app's own Python home exists.
+from hicksfield import sysdeps
 
 APP_NAME = "HicksField"
 INSTALL_DIR_NAME = "hicksfield-app"
@@ -76,16 +82,39 @@ def copy_tree(src, target, log):
     log(f"Copied {count} files to {target}.")
 
 
+def install_system_deps(log, warnings):
+    """Install ffmpeg and the Python venv package, if missing.
+
+    Non-fatal: if the user says no to the permission window, or the
+    install fails, the rest of the install goes on and the miss is
+    reported as a warning at the end. The venv step below will still
+    fail plainly if the venv package is the missing one, because the
+    app cannot be installed without it.
+    """
+    missing = sysdeps.missing_packages()
+    if not missing:
+        log("System packages are already there (ffmpeg, Python venv).")
+        return
+    log("Installing missing system packages: "
+        f"{sysdeps.describe_packages(missing)}. A permission window "
+        "will ask for your password.")
+    warnings.extend(sysdeps.install_missing_packages(progress_cb=log))
+
+
 def make_venv(target, log):
     venv_dir = target / "venv"
-    code, _out, err = run(
+    code, _out, _err = run(
         [sys.executable, "-m", "venv", str(venv_dir)], timeout=300)
     python = venv_dir / "bin" / "python"
     if code != 0 or not python.exists():
+        # The stderr tail is not shown: on a missing venv package it
+        # suggests a terminal command, and this installer never asks
+        # the user to use a terminal.
         raise InstallError(
             "Could not make the app's Python home.",
-            "Install it with: sudo apt install python3.12-venv "
-            f"({err.strip().splitlines()[-1] if err.strip() else ''})",
+            "The installer could not add the Python venv package. Run "
+            "the installer again and allow the permission step when "
+            "it asks.",
         )
     log("Made the app's Python home.")
     return python
@@ -227,8 +256,10 @@ def install(target, log, progress):
     warnings = []
     src = source_dir()
     progress(0.05)
+    install_system_deps(log, warnings)
+    progress(0.1)
     copy_tree(src, target, log)
-    progress(0.2)
+    progress(0.25)
     venv_python = make_venv(target, log)
     progress(0.3)
     install_deps(venv_python, log)

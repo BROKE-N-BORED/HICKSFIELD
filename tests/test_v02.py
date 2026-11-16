@@ -273,7 +273,7 @@ class Item5Tests(GuiBase):
 
     def _fake_stream(self, scenes):
         def _run(idea, model, on_scene, report=None,
-                 cancel_event=None, timeout=180):
+                 cancel_event=None, timeout=180, scene_length="medium"):
             for scene in scenes:
                 on_scene(scene)
                 if report is not None:
@@ -311,7 +311,7 @@ class Item5Tests(GuiBase):
         started = threading.Event()
 
         def _run(idea, model, on_scene, report=None,
-                 cancel_event=None, timeout=180):
+                 cancel_event=None, timeout=180, scene_length="medium"):
             on_scene({"prompt": "a stool", "narration": "A stool."})
             started.set()
             deadline = time.monotonic() + 10
@@ -375,8 +375,7 @@ class Item6Tests(GuiBase):
             if widget is main.idea_edit:
                 break
         order = [main.scenes_tile, main.stills_tile, main.voice_tile,
-                 main.film_tile, main.scenes_button, main.stills_button,
-                 main.voice_button, main.export_button]
+                 main.film_tile, main.scenes_button]
         positions = [chain.index(w) for w in order]
         self.assertEqual(positions, sorted(positions))
 
@@ -389,7 +388,8 @@ class Item7Tests(GuiBase):
                  window.findChildren(QLabel)]
         self.assertIn("Picture prompt:", texts)
         self.assertIn("Spoken line:", texts)
-        self.assertTrue(any("Any small local model works" in text
+        self.assertTrue(any("Pick the model that breaks your idea "
+                            "into scenes" in text
                             for text in texts))
 
 
@@ -912,9 +912,9 @@ class Item20Tests(GuiBase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_version_is_0_2_0(self):
+    def test_version_is_0_3_0(self):
         from hicksfield import __version__
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.3.0")
 
 
 if __name__ == "__main__":

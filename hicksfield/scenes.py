@@ -20,6 +20,10 @@ from pathlib import Path
 from hicksfield.errors import HicksFieldError
 
 PROJECT_FILE = "project.json"
+# The project file format version. A project saved by this HicksField
+# carries version 1; a project with a higher version was made by a
+# newer HicksField and cannot be opened here.
+PROJECT_FORMAT_VERSION = 1
 DEFAULT_SCENE_SECONDS = 5
 STILLS_DIR = "stills"
 CLIPS_DIR = "clips"
@@ -39,6 +43,22 @@ class Scene:
     still: str = ""   # relative path, e.g. stills/scene-01.png
     clip: str = ""    # relative path, e.g. clips/scene-01.mp4
     audio: str = ""   # relative path, e.g. audio/scene-01.wav
+    # What each asset was made from. Empty means unknown (a scene
+    # from before provenance was kept): the asset is kept as long as
+    # its file exists, so old projects are never forced to remake
+    # everything on their first run under a newer HicksField.
+    still_prompt: str = ""
+    voice_text: str = ""
+    still_seed: int = 0  # 0 means no seed was recorded
+    # The voice that spoke the line, e.g. en_US-lessac-medium.
+    voice_id: str = ""
+    # The camera move for this scene: "" means the film picks (the
+    # move rotates by scene number), otherwise one of the moves in
+    # video.MOTIONS, or "still" for no move at all.
+    motion: str = ""
+    # The move the clip was actually made with (the choice resolved:
+    # "auto" becomes the move for the scene's number).
+    clip_motion: str = ""
 
     def to_dict(self):
         return asdict(self)
@@ -47,12 +67,22 @@ class Scene:
     def from_dict(cls, data):
         if not isinstance(data, dict):
             return cls()
+        try:
+            seed = int(data.get("still_seed", 0) or 0)
+        except (TypeError, ValueError):
+            seed = 0
         return cls(
             prompt=str(data.get("prompt", "")),
             narration=str(data.get("narration", "")),
             still=str(data.get("still", "")),
             clip=str(data.get("clip", "")),
             audio=str(data.get("audio", "")),
+            still_prompt=str(data.get("still_prompt", "")),
+            voice_text=str(data.get("voice_text", "")),
+            still_seed=seed,
+            voice_id=str(data.get("voice_id", "")),
+            motion=str(data.get("motion", "")),
+            clip_motion=str(data.get("clip_motion", "")),
         )
 
 
@@ -63,20 +93,38 @@ class Project:
     scenes: list = field(default_factory=list)
     created: str = ""
     updated: str = ""
+    # The voice that reads the lines, e.g. en_US-lessac-medium.
+    # The default is the voice every film used before voices could
+    # be picked, so old projects keep sounding the same.
+    voice: str = "en_US-lessac-medium"
 
     def to_dict(self):
         return {
+            "version": PROJECT_FORMAT_VERSION,
             "name": self.name,
             "idea": self.idea,
             "scenes": [s.to_dict() for s in self.scenes],
             "created": self.created,
             "updated": self.updated,
+            "voice": self.voice,
         }
 
     @classmethod
     def from_dict(cls, data):
         if not isinstance(data, dict):
             raise HicksFieldError("The project file is not a project.")
+        # No version means an old project, saved before versions
+        # existed: it loads as version 1. A version newer than this
+        # HicksField knows is refused plainly.
+        try:
+            version = int(data.get("version", 1))
+        except (TypeError, ValueError):
+            version = 1
+        if version > PROJECT_FORMAT_VERSION:
+            raise HicksFieldError(
+                "This project was made with a newer HicksField.",
+                "Update HicksField to open it.",
+            )
         scenes = [Scene.from_dict(s) for s in data.get("scenes", [])]
         return cls(
             name=str(data.get("name", "Untitled film")),
@@ -84,6 +132,7 @@ class Project:
             scenes=scenes,
             created=str(data.get("created", "")),
             updated=str(data.get("updated", "")),
+            voice=str(data.get("voice", "en_US-lessac-medium")),
         )
 
 
@@ -97,6 +146,48 @@ def scene_clip_name(index):
 
 def scene_audio_name(index):
     return f"scene-{index + 1:02d}.wav"
+
+
+def _asset_missing(project_dir, relative):
+    if not relative:
+        return True
+    path = Path(project_dir) / relative
+    return not path.exists() or path.stat().st_size == 0
+
+
+def still_is_stale(scene, project_dir):
+    """True when the picture needs making: its file is missing, or it
+    was made from a prompt that no longer matches the scene. A
+    picture with no recorded prompt is only stale when missing."""
+    if _asset_missing(project_dir, scene.still):
+        return True
+    return bool(scene.still_prompt) and scene.still_prompt != scene.prompt
+
+
+def voice_is_stale(scene, project_dir, voice_id=None):
+    """True when the spoken line needs making: its file is missing,
+    or it was spoken from a line that no longer matches the scene,
+    or (when `voice_id` is given) it was spoken in another voice. A
+    line with no recorded text or voice is only stale when missing."""
+    if _asset_missing(project_dir, scene.audio):
+        return True
+    if bool(scene.voice_text) and scene.voice_text != scene.narration:
+        return True
+    return bool(voice_id) and bool(scene.voice_id) \
+        and scene.voice_id != voice_id
+
+
+def clip_is_stale(scene, project_dir, voice_id=None, motion=None):
+    """True when the moving clip needs making: its file is missing,
+    or it was made with another camera move (when `motion` is
+    given), or its picture or spoken line is stale (a clip built
+    from old pieces is old itself)."""
+    if _asset_missing(project_dir, scene.clip):
+        return True
+    if motion and scene.clip_motion and scene.clip_motion != motion:
+        return True
+    return (still_is_stale(scene, project_dir)
+            or voice_is_stale(scene, project_dir, voice_id))
 
 
 def project_paths(project_dir):

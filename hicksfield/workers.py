@@ -14,11 +14,14 @@ and the lock release runs through a plain callback that does not need
 the window.
 """
 
+import logging
 import threading
 import weakref
 
 from PySide6.QtCore import QObject, Signal
 from shiboken6 import isValid
+
+logger = logging.getLogger("hicksfield.workers")
 
 # Workers still running, for a clean shutdown: the test suite (and any
 # embedder) can cancel and join them before Qt goes away, so no thread
@@ -37,12 +40,17 @@ class JobLock:
     def try_start(self, owner):
         with self._lock:
             if self._owner is not None:
+                logger.info("Job refused: %s is already running",
+                            self._owner)
                 return False
             self._owner = owner
+            logger.info("Job lock taken by %s", owner)
             return True
 
     def finish(self):
         with self._lock:
+            if self._owner is not None:
+                logger.info("Job lock released by %s", self._owner)
             self._owner = None
 
     @property
@@ -83,6 +91,7 @@ class Worker(QObject):
     def start(self):
         with _LIVE_LOCK:
             _LIVE_WORKERS.add(self)
+        logger.info("Job started")
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -101,9 +110,11 @@ class Worker(QObject):
         try:
             result = self._func(self._report, self._cancel)
         except BaseException as exc:  # noqa: BLE001 - forwarded to the GUI
+            logger.info("Job failed: %s", type(exc).__name__)
             if isValid(self):
                 self.error.emit(exc)
         else:
+            logger.info("Job finished")
             if isValid(self):
                 self.done.emit(result)
         finally:

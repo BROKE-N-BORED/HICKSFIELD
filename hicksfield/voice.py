@@ -4,6 +4,8 @@ Piper turns text into speech on CPU, with no network and no account.
 The voice model is downloaded once, from inside the app, with progress.
 """
 
+import hashlib
+import logging
 import os
 import shutil
 import subprocess
@@ -15,22 +17,109 @@ from hicksfield import paths
 from hicksfield.downloader import download
 from hicksfield.errors import (
     CancelledError,
+    DownloadError,
     EngineNotReadyError,
     HicksFieldError,
 )
 from hicksfield.steps import run_steps
 
+logger = logging.getLogger("hicksfield.voice")
+
 VOICE_ID = "en_US-lessac-medium"
-VOICE_FILES = [
-    "en_US-lessac-medium.onnx",
-    "en_US-lessac-medium.onnx.json",
-]
-VOICE_BASE_URL = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
-    "en/en_US/lessac/medium/"
-)
+# The voices the Voice window offers. Each entry: a short label, a
+# plain-words description of what it sounds like, whether it is the
+# recommended one, where its files live, and the files themselves
+# with their published sizes in bytes and SHA-256 checksums where
+# published. Sizes and checksums are taken from the published voice
+# files (rhasspy/piper-voices on HuggingFace, checked 2026-11-15):
+# a download that finishes at any other size, or with another
+# checksum, is refused, so a truncated download fails here instead
+# of confusingly at speak time. No checksum is published for the
+# small settings files, so they are checked by size only.
+VOICES = {
+    "en_US-lessac-medium": {
+        "label": "Lessac",
+        "description": "A clear American voice.",
+        "recommended": True,
+        "base_url": (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+            "en/en_US/lessac/medium/"
+        ),
+        "files": {
+            "en_US-lessac-medium.onnx": {
+                "size": 63201294,
+                "sha256": (
+                    "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16"
+                    "b1b46eeaaf019f"
+                ),
+            },
+            "en_US-lessac-medium.onnx.json": {
+                "size": 4885,
+                "sha256": None,
+            },
+        },
+    },
+    "en_US-ryan-high": {
+        "label": "Ryan",
+        "description": "A clear American voice that sounds the "
+                       "sharpest. A bigger download.",
+        "recommended": False,
+        "base_url": (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+            "en/en_US/ryan/high/"
+        ),
+        "files": {
+            "en_US-ryan-high.onnx": {
+                "size": 120786792,
+                "sha256": (
+                    "b3990d7606e183ec8dbfba70a4607074f162de1a0c412e018"
+                    "0d1ff60bb154eca"
+                ),
+            },
+            "en_US-ryan-high.onnx.json": {
+                "size": 4166,
+                "sha256": None,
+            },
+        },
+    },
+    "en_GB-alan-medium": {
+        "label": "Alan",
+        "description": "A British voice.",
+        "recommended": False,
+        "base_url": (
+            "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+            "en/en_GB/alan/medium/"
+        ),
+        "files": {
+            "en_GB-alan-medium.onnx": {
+                "size": 63201294,
+                "sha256": (
+                    "0a309668932205e762801f1efc2736cd4b0120329622adf6"
+                    "2be09e56339d3330"
+                ),
+            },
+            "en_GB-alan-medium.onnx.json": {
+                "size": 4888,
+                "sha256": None,
+            },
+        },
+    },
+}
+# The default voice's files, sizes, checksum, and download address,
+# kept as plain names for the callers that only ever meant this one.
+VOICE_FILES = list(VOICES[VOICE_ID]["files"])
+VOICE_FILE_SIZES = {
+    name: info["size"]
+    for name, info in VOICES[VOICE_ID]["files"].items()
+}
+VOICE_MODEL_SHA256 = VOICES[VOICE_ID]["files"][VOICE_FILES[0]]["sha256"]
+VOICE_BASE_URL = VOICES[VOICE_ID]["base_url"]
 PIPER_PACKAGE = "piper-tts"
 SYNTH_TIMEOUT_S = 300
+
+# Checksum results cached per run, keyed on path, size, and mtime, so
+# a status check does not re-hash the 60 MB model every time.
+_CHECKSUM_CACHE = {}
 
 
 def find_piper():
@@ -49,29 +138,96 @@ def find_piper():
     return Path(found) if found else None
 
 
-def voice_dir():
+def voice_dir(voice_id=VOICE_ID):
     override = os.environ.get("HICKSFIELD_VOICE_DIR")
     if override:
-        return Path(override)
-    return paths.voices_dir() / VOICE_ID
+        # The override names one voice's folder (used by tests): it
+        # is the default voice's folder, and other voices sit beside
+        # it under their own names.
+        if voice_id == VOICE_ID:
+            return Path(override)
+        return Path(override).parent / voice_id
+    return paths.voices_dir() / voice_id
 
 
-def voice_files():
-    return [(name, VOICE_BASE_URL + name) for name in VOICE_FILES]
+def _voice_entry(voice_id):
+    """The VOICES entry for `voice_id`, or None when unknown."""
+    return VOICES.get(voice_id)
 
 
-def voice_status():
-    have = [name for name, _url in voice_files()
-            if (voice_dir() / name).exists()
-            and (voice_dir() / name).stat().st_size > 0]
-    return len(have), len(VOICE_FILES)
+def _voice_file_info(voice_id, name):
+    entry = _voice_entry(voice_id)
+    if entry is None:
+        return None
+    return entry["files"].get(name)
 
 
-def is_ready():
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checksum_ok(path, expected_sha256):
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    key = (str(path), stat.st_size, stat.st_mtime_ns, expected_sha256)
+    if key in _CHECKSUM_CACHE:
+        return _CHECKSUM_CACHE[key]
+    try:
+        ok = _sha256_file(path) == expected_sha256
+    except OSError:
+        ok = False
+    _CHECKSUM_CACHE[key] = ok
+    return ok
+
+
+def voice_file_ok(name, voice_id=VOICE_ID):
+    """Whether a voice file on disk is whole: right size, and for the
+    model file, the right checksum too."""
+    path = voice_dir(voice_id) / name
+    if not path.exists():
+        return False
+    size = path.stat().st_size
+    if size <= 0:
+        return False
+    info = _voice_file_info(voice_id, name)
+    if info is None:
+        return False
+    expected = info.get("size")
+    if expected is not None and size != expected:
+        return False
+    checksum = info.get("sha256")
+    if checksum is not None:
+        return _checksum_ok(path, checksum)
+    return True
+
+
+def voice_files(voice_id=VOICE_ID):
+    entry = _voice_entry(voice_id)
+    if entry is None:
+        return []
+    return [(name, entry["base_url"] + name)
+            for name in entry["files"]]
+
+
+def voice_status(voice_id=VOICE_ID):
+    have = [name for name, _url in voice_files(voice_id)
+            if voice_file_ok(name, voice_id)]
+    return len(have), len(voice_files(voice_id))
+
+
+def is_ready(voice_id=VOICE_ID):
     """Return (ready, plain-words status)."""
+    if _voice_entry(voice_id) is None:
+        return False, "That voice is not one HicksField knows."
     if find_piper() is None:
         return False, "Not set up yet: the voice program is missing."
-    have, total = voice_status()
+    have, total = voice_status(voice_id)
     if have < total:
         return False, (
             f"Set up halfway: the voice is {have} of {total} files "
@@ -80,10 +236,12 @@ def is_ready():
     return True, "Ready."
 
 
-def setup(report=None, cancel_event=None):
+def setup(report=None, cancel_event=None, voice_id=VOICE_ID):
     steps = [
         (30, "Getting the voice program", _setup_piper),
-        (70, "Downloading the voice", _setup_voice_files),
+        (70, "Downloading the voice",
+         lambda progress, cancel: _setup_voice_files(
+             progress, cancel, voice_id)),
     ]
     run_steps(steps, report=report, cancel_event=cancel_event)
 
@@ -105,15 +263,20 @@ def _setup_piper(progress, cancel_event):
     progress(1.0, "")
 
 
-def _setup_voice_files(progress, cancel_event):
-    have, total = voice_status()
+def _setup_voice_files(progress, cancel_event, voice_id=VOICE_ID):
+    if _voice_entry(voice_id) is None:
+        raise HicksFieldError(
+            "That voice is not one HicksField knows.",
+            "Pick another voice in the Voice window.",
+        )
+    have, total = voice_status(voice_id)
     if have >= total:
         progress(1.0, "already there")
         return
-    files = voice_files()
+    files = voice_files(voice_id)
     for index, (name, url) in enumerate(files):
-        dest = voice_dir() / name
-        if dest.exists() and dest.stat().st_size > 0:
+        dest = voice_dir(voice_id) / name
+        if voice_file_ok(name, voice_id):
             progress((index + 1) / len(files), name)
             continue
 
@@ -122,8 +285,22 @@ def _setup_voice_files(progress, cancel_event):
                 base = _index / len(files)
                 progress(base + (done / total_bytes) / len(files), name)
 
-        download(url, dest, progress_cb=_cb, cancel_event=cancel_event)
-    have, total = voice_status()
+        # A file that is here but not whole (wrong size, or the model
+        # file with a wrong checksum) must go first: the downloader
+        # takes a right-sized file as done, so a corrupt model would
+        # otherwise fail its checksum check on every retry.
+        if dest.exists():
+            dest.unlink()
+        info = _voice_file_info(voice_id, name)
+        download(url, dest, expected_size=info["size"] if info else None,
+                 progress_cb=_cb, cancel_event=cancel_event)
+        if not voice_file_ok(name, voice_id):
+            raise DownloadError(
+                "The voice file downloaded but does not match its "
+                "checksum.",
+                "Try the download again.",
+            )
+    have, total = voice_status(voice_id)
     if have < total:
         raise HicksFieldError(
             "The voice is still missing files.",
@@ -145,16 +322,19 @@ def wav_duration(path):
         return None
 
 
-def synthesize(text, out_path, cancel_event=None):
-    """Speak `text` into a WAV file. Returns (path, duration_seconds)."""
-    ready, status = is_ready()
+def synthesize(text, out_path, cancel_event=None,
+               voice_id=VOICE_ID):
+    """Speak `text` into a WAV file with the voice `voice_id`.
+    Returns (path, duration_seconds)."""
+    ready, status = is_ready(voice_id)
     if not ready:
         raise EngineNotReadyError(
             f"The voice is not ready: {status}",
             "Set it up from the Voice window first.",
         )
+    logger.info("Speaking a line")
     piper = find_piper()
-    model = voice_dir() / VOICE_FILES[0]
+    model = voice_dir(voice_id) / voice_files(voice_id)[0][0]
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -193,4 +373,5 @@ def synthesize(text, out_path, cancel_event=None):
             "The voice finished but the sound file is empty.",
             "Try again.",
         )
+    logger.info("Line spoken (%.1f seconds)", duration)
     return out_path, duration

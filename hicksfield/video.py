@@ -8,6 +8,7 @@ Progress comes from ffmpeg itself: the progress file reports the encoded
 time, so the bar shows real work, not a guess.
 """
 
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,8 @@ import time
 from pathlib import Path
 
 from hicksfield.errors import CancelledError, FFmpegMissingError, HicksFieldError
+
+logger = logging.getLogger("hicksfield.video")
 
 CLIP_WIDTH = 1280
 CLIP_HEIGHT = 720
@@ -28,6 +31,10 @@ PRESCALE_WIDTH = 1920
 PRESCALE_HEIGHT = 1080
 
 MOTIONS = ("zoomin", "zoomout", "panleft", "panright")
+# A still picture: no camera move at all. Not part of the rotation
+# above, only picked per scene.
+MOTION_STILL = "still"
+ALL_MOTIONS = MOTIONS + (MOTION_STILL,)
 
 CAPTION_FONTS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -83,9 +90,13 @@ def require_ffmpeg():
         raise FFmpegMissingError()
 
 
-def motion_for_scene(index):
-    """The camera move for a scene: fixed by scene number, so a rebuild
-    of the same film looks the same."""
+def motion_for_scene(index, motion=""):
+    """The camera move for a scene. A chosen move wins: "" or "auto"
+    means the film picks, rotating by scene number so a rebuild of
+    the same film looks the same. An unknown move falls back to the
+    rotation too."""
+    if motion in ALL_MOTIONS:
+        return motion
     return MOTIONS[index % len(MOTIONS)]
 
 
@@ -104,6 +115,11 @@ def zoompan_filter(motion, duration, fps=CLIP_FPS,
     elif motion == "panright":
         zoom = str(PAN_ZOOM)
         x = f"(iw-iw/zoom)*on/{frames}"
+        y = "ih/2-(ih/zoom/2)"
+    elif motion == MOTION_STILL:
+        # No move: the frame stays put for the whole clip.
+        zoom = "1.0"
+        x = "iw/2-(iw/zoom/2)"
         y = "ih/2-(ih/zoom/2)"
     else:  # zoomin
         zoom = f"min(zoom+{ZOOM_IN_RATE},{ZOOM_MAX})"
@@ -227,6 +243,7 @@ def make_scene_clip(still_path, out_clip, duration, motion,
                     audio_path=None, cancel_event=None, progress_cb=None):
     """Turn one still into a moving clip of `duration` seconds."""
     require_ffmpeg()
+    logger.info("Making a moving clip (%.1f seconds)", duration)
     ffmpeg = find_ffmpeg()
     out_clip = Path(out_clip)
     out_clip.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +269,7 @@ def make_scene_clip(still_path, out_clip, duration, motion,
             "ffmpeg finished but the scene clip is missing.",
             "Try again.",
         )
+    logger.info("Moving clip made")
     return out_clip
 
 
@@ -294,6 +312,7 @@ def assemble(clips, film_path, srt_path=None, font_path=None,
              total_seconds=None, cancel_event=None, progress_cb=None):
     """Cut scene clips together into the finished film."""
     require_ffmpeg()
+    logger.info("Cutting the film together (%d clips)", len(clips))
     ffmpeg = find_ffmpeg()
     film_path = Path(film_path)
     film_path.parent.mkdir(parents=True, exist_ok=True)
@@ -331,6 +350,7 @@ def assemble(clips, film_path, srt_path=None, font_path=None,
             "ffmpeg finished but the film file is missing.",
             "Try again.",
         )
+    logger.info("Film cut together")
     return film_path
 
 
@@ -351,3 +371,28 @@ def probe_duration(path):
         return float(proc.stdout.strip())
     except ValueError:
         return None
+
+
+def extract_first_frame(film_path, out_path, timeout_s=60):
+    """Save the film's first frame as a picture, for the Export
+    window's poster. Returns the path, or None when the frame could
+    not be taken (no ffmpeg, a broken film, a timeout): the caller
+    stays black and says nothing."""
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None:
+        return None
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            [str(ffmpeg), "-y", "-v", "error", "-i", str(film_path),
+             "-vframes", "1", str(out_path)],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return None
+    return out_path

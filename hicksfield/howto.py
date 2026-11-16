@@ -28,6 +28,13 @@ HOWTO_TOPICS = [
         "A scene is one picture and one spoken line. The picture prompt "
         "says what the picture shows. The narration is what the voice "
         "says over that picture.\n\n"
+        "Before the breakdown, pick Short, Medium, or Long for how many "
+        "scenes the film gets. Short is 3 to 5 scenes and quickest to "
+        "build. Medium is 3 to 8 scenes, the usual. Long is 8 to 12 "
+        "scenes and takes longest.\n\n"
+        "Each scene has a camera move: push in, pull out, pan left, pan "
+        "right, still, or Auto, where the film picks a move for the "
+        "scene. Changing a scene's move makes its moving clip again.\n\n"
         "You can add a scene, change a scene, or remove one. Removing a "
         "scene asks first. A scene with no picture prompt cannot make a "
         "picture, and a scene with no spoken line stays silent.",
@@ -45,10 +52,16 @@ HOWTO_TOPICS = [
     ),
     (
         "Voice",
-        "The Voice window gives the film its spoken lines. The first time, "
-        "press Set up the voice. It downloads one voice, about 60 MB.\n\n"
+        "The Voice window gives the film its spoken lines. Pick a voice "
+        "first: Lessac, Ryan, or Alan. Each sounds different; Lessac is "
+        "the usual choice. The note under the picker says what each "
+        "voice sounds like and how big its download is.\n\n"
+        "The first time, press Set up the voice. It downloads the "
+        "picked voice, about 60 MB for Lessac or Alan, about 120 MB "
+        "for Ryan.\n\n"
         "Press Make the spoken lines to speak every scene's line. A line "
-        "that is already spoken is kept, not made again.",
+        "that is already spoken is kept, not made again. Changing the "
+        "voice makes the lines again in the new voice.",
     ),
     (
         "Export",
@@ -64,7 +77,8 @@ HOWTO_TOPICS = [
         "Engines and voices live in the app data folder on this computer, "
         "not in the film folders. Downloads resume after a failure or a "
         "freeze. A download that finishes is checked against its size, "
-        "and the picture model is checked against its checksum too.\n\n"
+        "and the picture model and the voice model are checked against "
+        "their checksums too.\n\n"
         "Only one big job runs at a time, so the desktop stays usable "
         "while a job runs.",
     ),
@@ -81,7 +95,8 @@ HOWTO_TOPICS = [
         "The lamp in the corner says what the app is doing: grey is idle, "
         "brass is working, green is done, red means something went wrong. "
         "The words next to it say what happened and what to do.\n\n"
-        "If ffmpeg is missing, install it with: sudo apt install ffmpeg\n\n"
+        "If ffmpeg is missing, run the HicksField installer again. It "
+        "installs ffmpeg for you.\n\n"
         "The Debug report button in the Help menu copies a report about "
         "what the app was doing. It holds no secrets.",
     ),

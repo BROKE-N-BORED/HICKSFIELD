@@ -20,7 +20,8 @@ class ErrorTests(unittest.TestCase):
 
     def test_ffmpeg_error_names_the_fix(self):
         err = FFmpegMissingError()
-        self.assertIn("sudo apt install ffmpeg", err.plain_text())
+        self.assertIn("installer", err.plain_text().lower())
+        self.assertNotIn("sudo apt", err.plain_text())
         self.assertIn("ffmpeg", err.message.lower())
 
     def test_ollama_error_offers_manual_scenes(self):

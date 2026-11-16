@@ -19,8 +19,8 @@ account, no subscription, no cloud.
 ## What it needs
 
 - Linux, Python 3.10 or newer.
-- ffmpeg, for motion, sound, and the finished MP4. If ffmpeg is missing,
-  HicksField tells you how to install it.
+- ffmpeg, for motion, sound, and the finished MP4. The installer
+  installs it for you (it asks once for permission).
 - A stills engine, set up from inside the app the first time you make
   pictures. The fast one uses 1-step distilled image models. The steady
   one builds a small C++ image tool from source. Both are free.
@@ -31,9 +31,14 @@ account, no subscription, no cloud.
 
 ## Install
 
-Double-click the installer. It installs HicksField and everything it needs,
-adds HicksField to the app menu, and checks the install works before it
-reports success. No terminal needed.
+Get the code first: on the GitHub Release page, download the source
+code, or clone the repo:
+
+`git clone https://github.com/BROKE-N-BORED/HICKSFIELD.git`
+
+Then double-click the installer. It installs HicksField, ffmpeg, and the
+Python venv package, adds HicksField to the app menu, and checks the
+install works before it reports success. No terminal needed.
 
 To install from a terminal instead: `bash install.sh`
 
