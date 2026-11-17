@@ -279,13 +279,18 @@ class VoiceMotionStaleTests(TempEnvTestCase):
 
     def test_legacy_no_voice_or_motion_is_fresh(self):
         """Old projects carry no voice or move: a file that exists
-        is kept, not remade."""
+        is kept, not remade, under the voice it was made with.
+        A missing voice means the old default (Lessac), so it is
+        fresh under Lessac and out of date under any other voice."""
         self.scene.voice_id = ""
         self.scene.clip_motion = ""
         self.assertFalse(scenes_mod.voice_is_stale(
+            self.scene, self.project_dir, "en_US-lessac-medium"))
+        self.assertTrue(scenes_mod.voice_is_stale(
             self.scene, self.project_dir, "en_US-ryan-high"))
         self.assertFalse(scenes_mod.clip_is_stale(
-            self.scene, self.project_dir, "en_US-ryan-high", "panleft"))
+            self.scene, self.project_dir, "en_US-lessac-medium",
+            "panleft"))
 
     def test_no_voice_or_motion_given_keeps_old_behavior(self):
         # Without the current voice and move, only the words decide.

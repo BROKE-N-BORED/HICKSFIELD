@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import unittest
 from unittest import mock
@@ -9,6 +10,27 @@ from tests.helpers import TempEnvTestCase, write_png
 
 def _has_ffmpeg():
     return video.find_ffmpeg() is not None
+
+
+def _probe_duration(path):
+    """Length of a media file in seconds, or None when ffprobe is
+    missing or cannot read it. Test-only helper: the app no longer
+    probes durations."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _has_subtitles_filter():
@@ -76,7 +98,7 @@ class VideoFFmpegTests(TempEnvTestCase):
         video.make_scene_clip(self.still, clip, 1, "zoomin")
         self.assertTrue(clip.exists())
         self.assertGreater(clip.stat().st_size, 0)
-        duration = video.probe_duration(clip)
+        duration = _probe_duration(clip)
         if duration is not None:
             self.assertAlmostEqual(duration, 1.0, delta=0.2)
 
@@ -85,7 +107,7 @@ class VideoFFmpegTests(TempEnvTestCase):
         video.make_scene_clip(self.still, clip, 1, "still")
         self.assertTrue(clip.exists())
         self.assertGreater(clip.stat().st_size, 0)
-        duration = video.probe_duration(clip)
+        duration = _probe_duration(clip)
         if duration is not None:
             self.assertAlmostEqual(duration, 1.0, delta=0.2)
 
@@ -96,7 +118,7 @@ class VideoFFmpegTests(TempEnvTestCase):
         video.make_scene_clip(self.still, clip, 3, "panleft",
                               audio_path=audio)
         self.assertTrue(clip.exists())
-        duration = video.probe_duration(clip)
+        duration = _probe_duration(clip)
         if duration is not None:
             self.assertAlmostEqual(duration, 3.0, delta=0.3)
 
@@ -108,7 +130,7 @@ class VideoFFmpegTests(TempEnvTestCase):
         film = self.tmp / "film.mp4"
         video.assemble([clip1, clip2], film, total_seconds=2)
         self.assertTrue(film.exists())
-        duration = video.probe_duration(film)
+        duration = _probe_duration(film)
         if duration is not None:
             self.assertAlmostEqual(duration, 2.0, delta=0.3)
 

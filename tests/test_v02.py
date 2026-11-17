@@ -675,8 +675,13 @@ class Item14Tests(GuiBase):
             self.skipTest("QtMultimedia not available")
         audio = self._scene_with_audio()
         window = self._show(VoiceWindow)
-        QTest.mouseClick(window._play_buttons[0], Qt.LeftButton)
-        QTest.qWait(200)
+        # The sandbox has no audio device; the no-device guard
+        # (item 30) would refuse to play. Pretend one is present
+        # so this test exercises the play path.
+        with mock.patch("hicksfield.gui._audio_output_available",
+                        return_value=True):
+            QTest.mouseClick(window._play_buttons[0], Qt.LeftButton)
+            QTest.qWait(200)
         source = window._player.source().toLocalFile()
         self.assertEqual(source, str(audio))
         window._stop_line()
@@ -814,7 +819,7 @@ class Item17Tests(GuiBase):
             scenes_mod.Scene(prompt="a", narration="b")]
         self.state.project_changed.emit()
         window = self._show(ExportWindow)
-        self.assertIn("Fast is the one to start with",
+        self.assertIn("No picture engine is set up yet",
                       window.engine_note.text())
         self.assertIn("(recommended)", window.fast_build.text())
         self.assertNotIn("(recommended)", window.steady_build.text())
@@ -914,7 +919,7 @@ class Item20Tests(GuiBase):
 class VersionTests(unittest.TestCase):
     def test_version_is_0_3_0(self):
         from hicksfield import __version__
-        self.assertEqual(__version__, "0.3.0")
+        self.assertEqual(__version__, "0.4.0")
 
 
 if __name__ == "__main__":

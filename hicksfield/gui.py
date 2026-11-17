@@ -6,6 +6,7 @@ the window that started it shows real progress and a cancel button.
 Only one heavy job runs at a time across the whole app.
 """
 
+import concurrent.futures
 import copy
 import json
 import logging
@@ -14,9 +15,10 @@ import re
 import sys
 import time
 import weakref
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSize, Qt, QSettings, QTimer, QUrl
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QSettings, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -59,12 +61,14 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimedia import (
+        QAudioOutput, QMediaDevices, QMediaPlayer)
     from PySide6.QtMultimediaWidgets import QVideoWidget
     HAVE_MULTIMEDIA = True
 except ImportError:
     HAVE_MULTIMEDIA = False
     QAudioOutput = None
+    QMediaDevices = None
     QMediaPlayer = None
     QVideoWidget = None
 
@@ -134,6 +138,38 @@ def settings():
     return QSettings(ORG_NAME, APP_NAME)
 
 
+def _load_recent():
+    """The recent-films list from settings, always a list.
+
+    QSettings stores a 1-item list as a bare string, which reads back
+    as a `str`: iterating it yields characters and `insert` crashes.
+    A lone string is wrapped; anything that is not a list is dropped.
+    """
+    value = settings().value("recent", []) or []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return []
+
+
+def _recent_label(path):
+    """Enough of the path to tell same-named films apart: the film
+    folder plus its parent, e.g. "Films/dusk"."""
+    folder = Path(path)
+    parent = folder.parent.name
+    if parent:
+        return f"{parent}/{folder.name}"
+    return folder.name
+
+
+def _ollama_reachable():
+    """Is Ollama up? A 10 s timeout, retried once: a busy Ollama can
+    miss a single short check, and the checklist must not cry wolf
+    on a slow PC."""
+    return ollama.is_reachable(10) or ollama.is_reachable(10)
+
+
 def slugify(name):
     text = re.sub(r"[^a-z0-9]+", "-", name.strip().lower())
     return text.strip("-") or "film"
@@ -144,6 +180,9 @@ class AppState(QObject):
 
     project_changed = Signal()
     job_changed = Signal(object)
+    # A window asking the main window to open another window, by key
+    # ("stills", "voice", ...): windows do not know about each other.
+    open_window_requested = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -160,7 +199,7 @@ class AppState(QObject):
         while target.exists():
             target = base / f"{slug}-{suffix}"
             suffix += 1
-        self.project = scenes_mod.Project(idea="", scenes=[])
+        self.project = scenes_mod.new_project(name)
         self.project_dir = target
         scenes_mod.ensure_project_dirs(target)
         self.save()
@@ -185,10 +224,14 @@ class AppState(QObject):
         """Save the current project. The optional argument exists so
         this method can be passed straight to pipeline.build_film as
         its save_cb, which calls save_cb(project) after each piece
-        lands; the state always saves its own project."""
+        lands; the state always saves its own project. Saving
+        announces the change, so every window refreshes from the
+        saved state: retyping the idea on Main reaches the Scenes
+        echo, and a build's progress reaches the Export summary."""
         if self.project_dir is None:
             return
         scenes_mod.save_project(self.project, self.project_dir)
+        self.project_changed.emit()
 
     def try_job(self, owner):
         if self.job_lock.try_start(owner):
@@ -207,6 +250,12 @@ class AppState(QObject):
     def project_name(self):
         if self.project_dir is None:
             return "No film yet"
+        # The name the film was given. A film saved before names were
+        # kept still says "Untitled film": show its folder name
+        # instead, which is the name the user can see on disk.
+        name = self.project.name.strip()
+        if name and name.lower() != "untitled film":
+            return name
         return self.project_dir.name
 
 
@@ -345,23 +394,61 @@ class DebugReportWindow(ModeWindow):
         self.layout.addWidget(note)
         self.text = QTextEdit()
         self.text.setReadOnly(True)
-        self.text.setPlainText(debuglog.build_debug_report(
-            __version__, machine.machine_summary()))
+        self._load_report()
         self.layout.addWidget(self.text, 1)
         row = QHBoxLayout()
+        refresh_button = DipButton("Refresh")
+        refresh_button.setToolTip(
+            "Build the report again, from what the app is doing now.")
+        refresh_button.clicked.connect(self._refresh_report)
         copy_button = DipButton("Copy the report")
         copy_button.clicked.connect(self._copy)
         close_button = DipButton("Close")
         close_button.clicked.connect(self.close)
         row.addStretch(1)
+        row.addWidget(refresh_button)
         row.addWidget(copy_button)
         row.addWidget(close_button)
         self.layout.addLayout(row)
         self.finish_layout()
 
+    def _load_report(self):
+        self.text.setPlainText(debuglog.build_debug_report(
+            __version__, machine.machine_summary()))
+
+    def _refresh_report(self):
+        self._load_report()
+        self.show_status("done", "Refreshed.")
+
     def _copy(self):
         QApplication.clipboard().setText(self.text.toPlainText())
         self.show_status("done", "Copied.")
+
+
+def _short_date(iso_text):
+    """An ISO timestamp as a short date: "16 Nov 2026". Empty when
+    the text is blank or not a date."""
+    if not iso_text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(iso_text))
+    except ValueError:
+        return ""
+    return moment.strftime("%d %b %Y")
+
+
+def film_dates_text(project):
+    """The film's dates in plain words: "Started 16 Nov 2026. Last
+    saved 17 Nov 2026." Empty when the film has no dates yet."""
+    started = _short_date(project.created)
+    saved = _short_date(project.updated)
+    if started and saved and started != saved:
+        return f"Started {started}. Last saved {saved}."
+    if started:
+        return f"Started {started}."
+    if saved:
+        return f"Last saved {saved}."
+    return ""
 
 
 def _gb_text(mb):
@@ -462,6 +549,8 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self._build_central()
         state.project_changed.connect(_weak_slot(self, "_refresh"))
+        state.open_window_requested.connect(
+            _weak_slot(self, "open_window"))
         state.job_changed.connect(_weak_slot(self, "_on_job_changed"))
         self._refresh()
         self._check_ollama()
@@ -541,6 +630,7 @@ class MainWindow(QMainWindow):
             "Ctrl+N  New film\n"
             "Ctrl+O  Open film\n"
             "Ctrl+S  Save\n"
+            "Ctrl+Z  Undo the last scene change (in Scenes)\n"
             "F1  How to Use\n"
             "?  This list\n\n"
             "Tab moves between buttons and boxes. "
@@ -573,6 +663,9 @@ class MainWindow(QMainWindow):
         self.project_label = QLabel()
         self.project_label.setProperty("role", "section")
         layout.addWidget(self.project_label)
+        self.project_dates_label = QLabel()
+        self.project_dates_label.setProperty("role", "muted")
+        layout.addWidget(self.project_dates_label)
 
         hero = QFrame()
         hero.setProperty("role", "card")
@@ -632,9 +725,9 @@ class MainWindow(QMainWindow):
         self.scenes_button = DipButton("Break into scenes")
         self.scenes_button.setProperty("role", "primary")
         self.scenes_button.setToolTip(
-            "Open the Scenes window and break the idea into scenes.")
-        self.scenes_button.clicked.connect(
-            lambda: self.open_window("scenes"))
+            "Open the Scenes window. If an idea is typed and a model "
+            "is picked, the breakdown starts straight away.")
+        self.scenes_button.clicked.connect(self._break_from_home)
         buttons.addWidget(self.scenes_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -768,7 +861,7 @@ class MainWindow(QMainWindow):
         self._refresh_checklist()
 
     def _check_ollama(self):
-        worker = Worker(lambda report, cancel: ollama.is_reachable(3))
+        worker = Worker(lambda report, cancel: _ollama_reachable())
         self._ollama_worker = worker
         worker.done.connect(_weak_slot(self, "_on_ollama_checked"))
         worker.error.connect(_weak_slot(self, "_on_ollama_error"))
@@ -783,6 +876,14 @@ class MainWindow(QMainWindow):
         self._ollama_worker = None
         self._ollama_ok = False
         self._refresh_checklist()
+
+    def _break_from_home(self):
+        """The home button does what it says: open the Scenes window
+        and start the breakdown when an idea is typed and a model is
+        picked. Otherwise the window just opens, ready for the user
+        to finish setting up."""
+        window = self.open_window("scenes")
+        window.start_breakdown_if_ready()
 
     def open_window(self, key):
         builders = {
@@ -813,6 +914,9 @@ class MainWindow(QMainWindow):
     def _refresh(self):
         self.project_label.setText(
             f"Film: {self.state.project_name()}")
+        dates_text = film_dates_text(self.state.project)
+        self.project_dates_label.setText(dates_text)
+        self.project_dates_label.setVisible(bool(dates_text))
         idea = self.state.project.idea
         project_dir = self.state.project_dir
         if project_dir != self._idea_project_dir:
@@ -836,19 +940,21 @@ class MainWindow(QMainWindow):
         project_dir = self.state.project_dir
         count = len(project.scenes)
         stills_ready = voice_ready = clips_ready = 0
+        voice_id = project.voice
         if project_dir is not None:
-            for scene in project.scenes:
-                for field, counter in (("still", "stills_ready"),
-                                       ("audio", "voice_ready"),
-                                       ("clip", "clips_ready")):
-                    value = getattr(scene, field)
-                    if value and (project_dir / value).exists():
-                        if counter == "stills_ready":
-                            stills_ready += 1
-                        elif counter == "voice_ready":
-                            voice_ready += 1
-                        else:
-                            clips_ready += 1
+            for index, scene in enumerate(project.scenes):
+                # Out of date counts as to make, not ready: the same
+                # staleness checks the Stills, Voice, and Export
+                # windows use, so every window agrees.
+                if not scenes_mod.still_is_stale(scene, project_dir):
+                    stills_ready += 1
+                if not scenes_mod.voice_is_stale(scene, project_dir,
+                                                 voice_id):
+                    voice_ready += 1
+                motion = video.motion_for_scene(index, scene.motion)
+                if not scenes_mod.clip_is_stale(scene, project_dir,
+                                                voice_id, motion):
+                    clips_ready += 1
         film = (project_dir / scenes_mod.FILM_FILE
                 if project_dir is not None else None)
         film_built = film is not None and film.exists()
@@ -878,24 +984,32 @@ class MainWindow(QMainWindow):
 
     def _refresh_recent_menu(self):
         self._recent_menu.clear()
-        recent = settings().value("recent", []) or []
+        recent = _load_recent()
+        # Drop entries whose folder is gone, and save the pruned
+        # list, so the menu only ever offers films that open.
+        kept = [path for path in recent if Path(path).is_dir()]
+        if len(kept) != len(recent):
+            settings().setValue("recent", kept)
+            recent = kept
         if not recent:
             action = QAction("No recent films", self)
             action.setEnabled(False)
             self._recent_menu.addAction(action)
             return
         for path in recent:
-            action = QAction(Path(path).name, self)
+            action = QAction(_recent_label(path), self)
+            action.setToolTip(path)
             action.triggered.connect(
                 lambda _c, p=path: self._open_recent(p))
             self._recent_menu.addAction(action)
 
     def _remember_recent(self, project_dir):
-        recent = settings().value("recent", []) or []
+        recent = _load_recent()
         text = str(project_dir)
         if text in recent:
             recent.remove(text)
         recent.insert(0, text)
+        # Always store a real list, even with one item.
         settings().setValue("recent", recent[:MAX_RECENT])
         self._refresh_recent_menu()
 
@@ -978,7 +1092,7 @@ class MainWindow(QMainWindow):
     def _about(self):
         QMessageBox.about(
             self, "About HicksField",
-            "HicksField 0.3.0\n\nA free local film studio by "
+            "HicksField 0.4.0\n\nA free local film studio by "
             "Broke n' Bored Studio.\n\nYour idea in, a short film out. "
             "Everything runs on this computer.")
 
@@ -1025,6 +1139,15 @@ class ScenesWindow(ModeWindow):
         self._model_infos = {}
         self._breakdown_running = False
         self._incoming = []
+        # How many arrived scenes the list already shows, and whether
+        # the list is showing the breakdown at all: _show_incoming
+        # appends only the new rows instead of rebuilding the list
+        # per arrival.
+        self._incoming_shown = 0
+        self._incoming_list_ready = False
+        # True while the model check runs: Refresh stays disabled
+        # until it lands, so a double-click cannot start two checks.
+        self._checking_models = False
         # The row whose words are in the edit boxes, or -1 when the
         # boxes hold nothing to save: autosave writes the boxes back
         # to this scene before another scene is loaded.
@@ -1041,6 +1164,12 @@ class ScenesWindow(ModeWindow):
         self._refresh_pending = False
         # Snapshots of the scene list for Undo, newest last.
         self._undo_stack = []
+        # The project the window last refreshed for. A new project
+        # object means the film changed: the undo stack belongs to
+        # the old film and is cleared, and the edit boxes are
+        # autosaved into the old film before the reload.
+        self._seen_project = state.project
+        self._seen_project_dir = state.project_dir
         self.idea_echo = QLabel()
         self.idea_echo.setProperty("role", "muted")
         self.idea_echo.setWordWrap(True)
@@ -1074,6 +1203,7 @@ class ScenesWindow(ModeWindow):
         break_button.setProperty("role", "primary")
         break_button.setToolTip(
             "Ask the model to break the idea into scenes.")
+        break_button.setEnabled(False)
         break_button.clicked.connect(self._break_into_scenes)
         row.addWidget(break_button)
         self.break_button = break_button
@@ -1224,6 +1354,20 @@ class ScenesWindow(ModeWindow):
             self._refreshing = False
 
     def _refresh_now(self):
+        if (self.state.project is not self._seen_project
+                or self.state.project_dir != self._seen_project_dir):
+            # The film changed since the last refresh: save the
+            # boxes into the OLD film first (the reload below would
+            # otherwise throw the words away), then drop the old
+            # film's undo stack. The boxes belong to no row of the
+            # new film yet, so forget the loaded row before the list
+            # is cleared: clearing loads row -1, which must not
+            # autosave the old words into a new scene.
+            self._autosave_previous_project()
+            self._undo_stack.clear()
+            self._seen_project = self.state.project
+            self._seen_project_dir = self.state.project_dir
+            self._loaded_row = -1
         bar = self.scene_list.verticalScrollBar()
         scroll = bar.value()
         row = self.scene_list.currentRow()
@@ -1238,21 +1382,86 @@ class ScenesWindow(ModeWindow):
             self.scene_list.clear()
             for index, scene in enumerate(self.state.project.scenes):
                 self._add_scene_item(index, scene)
-        if 0 <= row < self.scene_list.count():
+            if not self.state.project.scenes:
+                self._add_empty_hint_item()
+        if (self.state.project.scenes
+                and 0 <= row < self.scene_list.count()):
             self.scene_list.setCurrentRow(row)
         bar.setValue(scroll)
+        self._refresh_undo_button()
 
-    def _add_scene_item(self, index, scene):
+    def _autosave_previous_project(self):
+        """Write the edit boxes into the film the window last
+        refreshed for, when they changed. Used on a film switch: by
+        the time the refresh runs, the state already holds the new
+        film, so the ordinary autosave would write the old film's
+        words into the new film's scene. No undo snapshot: the
+        stack belongs to the old film and is cleared with it."""
+        old = self._seen_project
+        row = self._loaded_row
+        if old is None or not (0 <= row < len(old.scenes)):
+            return
+        scene = old.scenes[row]
+        prompt = self.prompt_edit.toPlainText().strip()
+        narration = self.narration_edit.toPlainText().strip()
+        motion = self.motion_combo.currentData() or ""
+        if (prompt == scene.prompt and narration == scene.narration
+                and motion == scene.motion):
+            return
+        scene.prompt = prompt
+        scene.narration = narration
+        scene.motion = motion
+        if self._seen_project_dir is not None:
+            scenes_mod.save_project(old, self._seen_project_dir)
+
+    def _refresh_undo_button(self):
+        """Undo is offered only when it can act: a snapshot on the
+        stack, and no breakdown running."""
+        self.undo_button.setEnabled(
+            bool(self._undo_stack) and not self._breakdown_running)
+
+    def _add_empty_hint_item(self):
+        """A hint inside an empty list, so the empty box says what
+        to do next instead of sitting black and blank."""
+        frame = QFrame()
+        frame.setProperty("role", "scene")
+        frame.setAttribute(Qt.WA_TransparentForMouseEvents)
+        hint_layout = QHBoxLayout(frame)
+        hint_layout.setContentsMargins(8, 6, 8, 6)
+        hint = QLabel(
+            "No scenes yet. Break the idea down above, "
+            "or add one below.")
+        hint.setProperty("role", "muted")
+        hint.setWordWrap(True)
+        hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        hint_layout.addWidget(hint, 1)
+        item = QListWidgetItem()
+        item.setFlags(Qt.NoItemFlags)
+        item.setSizeHint(QSize(0, 64))
+        self.scene_list.addItem(item)
+        self.scene_list.setItemWidget(item, frame)
+
+    def _add_scene_item(self, index, scene, row=None):
         """One scene as a film-frame card: thumbnail, prompt, and the
         state marks for picture and voice. Both ready earns the green
-        edge."""
+        edge. Ready means fresh, not just present: an out-of-date
+        picture or line counts as to make. `row` inserts at a
+        position (a breakdown scene ahead of the waiting rows);
+        without it the card goes at the end."""
         project_dir = self.state.project_dir
-        still_ok = bool(
+        still_exists = bool(
             scene.still and project_dir is not None
             and (project_dir / scene.still).exists())
-        audio_ok = bool(
+        audio_exists = bool(
             scene.audio and project_dir is not None
             and (project_dir / scene.audio).exists())
+        # The same staleness checks the Stills and Voice windows
+        # use, so every window agrees. A missing file is stale, so
+        # the existence check also guards the None project dir.
+        still_ok = still_exists and not scenes_mod.still_is_stale(
+            scene, project_dir)
+        audio_ok = audio_exists and not scenes_mod.voice_is_stale(
+            scene, project_dir, self.state.project.voice)
         frame = QFrame()
         frame.setProperty(
             "role", "scene-done" if still_ok and audio_ok else "scene")
@@ -1266,7 +1475,7 @@ class ScenesWindow(ModeWindow):
         thumb = QLabel()
         thumb.setFixedSize(48, 48)
         thumb.setAttribute(Qt.WA_TransparentForMouseEvents)
-        if still_ok:
+        if still_exists:
             pixmap = QPixmap(str(project_dir / scene.still))
             thumb.setPixmap(pixmap.scaled(
                 48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -1279,8 +1488,27 @@ class ScenesWindow(ModeWindow):
         title = QLabel(f"Scene {index + 1}: {prompt[:70]}")
         title.setAttribute(Qt.WA_TransparentForMouseEvents)
         text_box.addWidget(title)
-        marks = ("Picture ready" if still_ok else "No picture yet",
-                 "Voice ready" if audio_ok else "No voice yet")
+        motion_text = {
+            "": "Auto move",
+            "zoomin": "Push in",
+            "zoomout": "Pull out",
+            "panleft": "Pan left",
+            "panright": "Pan right",
+            "still": "Still",
+        }.get(scene.motion, scene.motion or "Auto move")
+        if still_ok:
+            still_mark = "Picture ready"
+        elif still_exists:
+            still_mark = "Picture out of date"
+        else:
+            still_mark = "No picture yet"
+        if audio_ok:
+            audio_mark = "Voice ready"
+        elif audio_exists:
+            audio_mark = "Voice out of date"
+        else:
+            audio_mark = "No voice yet"
+        marks = (still_mark, audio_mark, motion_text)
         mark_label = QLabel("  \u00b7  ".join(marks))
         mark_label.setProperty("role", "muted")
         mark_label.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -1289,7 +1517,10 @@ class ScenesWindow(ModeWindow):
         item = QListWidgetItem()
         item.setData(Qt.UserRole, index)
         item.setSizeHint(QSize(0, 64))
-        self.scene_list.addItem(item)
+        if row is None:
+            self.scene_list.addItem(item)
+        else:
+            self.scene_list.insertItem(row, item)
         self.scene_list.setItemWidget(item, frame)
 
     def _add_skeleton_item(self):
@@ -1318,11 +1549,26 @@ class ScenesWindow(ModeWindow):
         self.scene_list.setItemWidget(item, frame)
 
     def _show_incoming(self):
-        self.scene_list.clear()
-        for index, scene in enumerate(self._incoming):
-            self._add_scene_item(index, scene)
-        for _ in range(3):
-            self._add_skeleton_item()
+        """Show the scenes that have arrived so far, appending only
+        the new rows: rebuilding the whole list per arrival flickers
+        on a slow PC with a dozen scenes. The first call for a
+        breakdown builds the list (scenes so far, then the waiting
+        rows); later calls insert each new scene ahead of them."""
+        if not self._incoming_list_ready:
+            self.scene_list.clear()
+            for index, scene in enumerate(self._incoming):
+                self._add_scene_item(index, scene)
+            for _ in range(3):
+                self._add_skeleton_item()
+            self._incoming_shown = len(self._incoming)
+            self._incoming_list_ready = True
+            return
+        while self._incoming_shown < len(self._incoming):
+            self._add_scene_item(
+                self._incoming_shown,
+                self._incoming[self._incoming_shown],
+                row=self._incoming_shown)
+            self._incoming_shown += 1
 
     def _autosave_scene(self):
         """Write the edit boxes into the loaded scene, if they
@@ -1352,7 +1598,7 @@ class ScenesWindow(ModeWindow):
             copy.deepcopy(self.state.project.scenes))
         if len(self._undo_stack) > 20:
             del self._undo_stack[:-20]
-        self.undo_button.setEnabled(True)
+        self._refresh_undo_button()
 
     def _undo(self):
         if not self._undo_stack:
@@ -1365,7 +1611,7 @@ class ScenesWindow(ModeWindow):
         self.state.project.scenes = scenes
         self.state.save()
         self.state.project_changed.emit()
-        self.undo_button.setEnabled(bool(self._undo_stack))
+        self._refresh_undo_button()
         self._load_scene(self.scene_list.currentRow())
         self.show_status("done", "Undid the last change.")
 
@@ -1437,6 +1683,7 @@ class ScenesWindow(ModeWindow):
         # Save the boxes into the scene first, while its row is
         # still right; the edited scene then lives at the target.
         self._autosave_scene()
+        self._push_undo()
         scenes[row], scenes[target] = scenes[target], scenes[row]
         self._loaded_row = target
         self.state.save()
@@ -1470,6 +1717,7 @@ class ScenesWindow(ModeWindow):
         # after the reorder the boxes belong to no row in particular.
         self._autosave_scene()
         self._loaded_row = -1
+        self._push_undo()
         self.state.project.scenes = [scenes[i] for i in order]
         self.state.save()
         self.state.project_changed.emit()
@@ -1496,6 +1744,7 @@ class ScenesWindow(ModeWindow):
         self.show_status("done", f"Scene {row + 1} saved.")
 
     def _add_scene(self):
+        self._push_undo()
         self.state.project.scenes.append(scenes_mod.Scene())
         self.state.save()
         self.state.project_changed.emit()
@@ -1524,31 +1773,73 @@ class ScenesWindow(ModeWindow):
         self.state.project_changed.emit()
         self.show_status("done", f"Scene {row + 1} removed.")
 
+    def _update_break_button(self):
+        """Break is ready only when a model is picked and nothing
+        else is running: a button that looks ready and then scolds
+        you is worse than a disabled one."""
+        ready = (self._ollama_ok and not self._breakdown_running
+                 and not self._checking_models
+                 and bool(self.model_combo.currentText()))
+        self.break_button.setEnabled(ready)
+
     def _refresh_models(self):
+        if self._checking_models or self._breakdown_running:
+            return
+        self._checking_models = True
+        self.refresh_button.setEnabled(False)
+        self._update_break_button()
         self.show_status("working", "Checking for Ollama.")
-        self.break_button.setEnabled(False)
         worker = Worker(self._check_ollama)
         self._worker = worker
+        worker.progress.connect(self._on_models_progress)
         worker.done.connect(self._on_models)
         worker.error.connect(self._on_models_error)
         worker.start()
 
     @staticmethod
-    def _check_ollama(_report, _cancel):
+    def _check_ollama(report, _cancel):
         infos = ollama.list_model_info()
-        for info in infos:
-            info["capabilities"] = ollama.model_capabilities(info["name"])
+        total = len(infos)
+        if not total:
+            return infos
+        # The capability check is one slow round trip per model, so
+        # the models are asked in parallel instead of one after
+        # another -- and each answer is reported, so the wait shows
+        # progress instead of silence.
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, total)) as pool:
+            futures = {
+                pool.submit(ollama.model_capabilities, info["name"]):
+                info for info in infos
+            }
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                info = futures[future]
+                try:
+                    info["capabilities"] = future.result()
+                except Exception:  # noqa: BLE001 - unknown, not incapable
+                    info["capabilities"] = []
+                done += 1
+                report("models", done / total,
+                       f"{done} of {total} models checked")
         return infos
+
+    def _on_models_progress(self, label, fraction, detail):
+        if label == "models":
+            self.show_status("working",
+                             f"Checking models. {detail}")
 
     def _on_models(self, infos):
         self._worker = None
+        self._checking_models = False
+        self.refresh_button.setEnabled(True)
         self._ollama_ok = True
         self._model_infos = {info["name"]: info for info in infos}
         self.model_combo.clear()
         names = [info["name"] for info in infos]
         self.model_combo.addItems(names)
         self.model_combo.setCurrentIndex(-1)
-        self.break_button.setEnabled(True)
+        self._update_break_button()
         if infos:
             self._show_model_recommendation()
             self.show_status(
@@ -1568,9 +1859,10 @@ class ScenesWindow(ModeWindow):
         name = self.model_combo.currentText()
         if not name:
             self._show_model_recommendation()
-            return
-        info = self._model_infos.get(name, {})
-        self.model_note.setText(self._model_note_text(name, info))
+        else:
+            info = self._model_infos.get(name, {})
+            self.model_note.setText(self._model_note_text(name, info))
+        self._update_break_button()
 
     def _show_model_recommendation(self):
         infos = list(self._model_infos.values())
@@ -1582,8 +1874,8 @@ class ScenesWindow(ModeWindow):
         elif infos:
             self.model_note.setText(
                 "Pick a model above. None of the installed models fits "
-                "this PC well. The note under a model says whether it "
-                "fits.")
+                "this PC well. The note below the picker says whether "
+                "the picked model fits.")
         else:
             self.model_note.setText(
                 "Pick the model that breaks your idea into scenes.")
@@ -1597,10 +1889,10 @@ class ScenesWindow(ModeWindow):
                     "idea into scenes (it does not chat). Pick another "
                     "one, or try it anyway.")
         if not ollama.model_fits(size):
-            total = machine.mem_total_mb()
+            available = machine.mem_available_mb()
             return (f"{name} · {size_text} · too big for this PC "
-                    f"({_gb_text(total)} of memory). It may run slowly "
-                    "or fail. You can still try it.")
+                    f"({_gb_text(available)} of memory free). It may "
+                    "run slowly or fail. You can still try it.")
         return f"{name} · {size_text} · fits this PC."
 
     @staticmethod
@@ -1612,24 +1904,40 @@ class ScenesWindow(ModeWindow):
             return (f"{name} does not chat, so it probably cannot break "
                     "the idea into scenes. Try it anyway?")
         if not ollama.model_fits(size):
-            total = machine.mem_total_mb()
+            available = machine.mem_available_mb()
             return (f"{name} is {format_bytes(size)} and this PC has "
-                    f"{_gb_text(total)} of memory. It may run slowly or "
-                    "fail. Try it anyway?")
+                    f"{_gb_text(available)} of memory free right now. "
+                    "It may run slowly or fail. Try it anyway?")
         return ""
 
     def _on_models_error(self, exc):
         self._worker = None
+        self._checking_models = False
+        self.refresh_button.setEnabled(True)
         self._ollama_ok = False
         self._model_infos = {}
         self.model_combo.clear()
-        self.break_button.setEnabled(False)
+        self._update_break_button()
         self.ollama_label.setText(
             "Ollama is not running. Scenes can be typed by hand below.")
         if isinstance(exc, OllamaUnreachableError):
             self.show_status("idle", exc.plain_text())
         else:
             self.show_plain_error(exc)
+
+    def start_breakdown_if_ready(self):
+        """Start the breakdown when an idea is typed and a model is
+        picked; otherwise stay open for the user to finish setting
+        up. Returns True when the breakdown started. The home
+        button calls this so it does what it says."""
+        if not self.state.project.idea.strip():
+            return False
+        if not self.model_combo.currentText():
+            return False
+        if self._breakdown_running:
+            return False
+        self._break_into_scenes()
+        return self._breakdown_running
 
     def _break_into_scenes(self):
         if not self.state.project.idea.strip():
@@ -1666,6 +1974,8 @@ class ScenesWindow(ModeWindow):
             return
         self._breakdown_running = True
         self._incoming = []
+        self._incoming_shown = 0
+        self._incoming_list_ready = False
         self._set_breakdown_ui(True)
         self._refresh()
         self.show_status("working", "Breaking the idea into scenes.")
@@ -1695,8 +2005,12 @@ class ScenesWindow(ModeWindow):
         if running:
             self.breakdown_progress.setRange(0, 0)
         self.breakdown_cancel.setVisible(running)
-        self.break_button.setEnabled(not running)
-        self.refresh_button.setEnabled(not running)
+        if running:
+            self.break_button.setEnabled(False)
+        else:
+            self._update_break_button()
+        self.refresh_button.setEnabled(
+            not running and not self._checking_models)
         self.model_combo.setEnabled(not running)
         self.length_combo.setEnabled(not running)
         self.scene_list.setEnabled(not running)
@@ -1708,6 +2022,7 @@ class ScenesWindow(ModeWindow):
         self.remove_button.setEnabled(not running)
         self.move_up_button.setEnabled(not running)
         self.move_down_button.setEnabled(not running)
+        self._refresh_undo_button()
 
     def _cancel_breakdown(self):
         if self._worker is not None:
@@ -1725,6 +2040,13 @@ class ScenesWindow(ModeWindow):
                 narration=data.get("narration", "")))
             self._show_incoming()
             return
+        if label == "loading":
+            # Still waiting for the first headers: the model is
+            # loading, not the server down.
+            self.show_status(
+                "working",
+                f"Ollama is still loading the model {detail}.")
+            return
         self.show_status(
             "working",
             f"Breaking the idea into scenes. {detail}")
@@ -1737,6 +2059,9 @@ class ScenesWindow(ModeWindow):
         # the refresh would save their words into a new scene.
         self._loaded_row = -1
         if self._incoming:
+            # The breakdown replaces hand-typed scenes: snapshot
+            # first, so the replace can be undone.
+            self._push_undo()
             self.state.project.scenes = list(self._incoming)
             self.state.save()
             self.state.project_changed.emit()
@@ -1870,19 +2195,26 @@ class StillsWindow(ModeWindow):
         self._worker = None
         self._active_card = None
         self._force_ram = False
+        # Thumbnail cache: (path, mtime, size) -> icon. _refresh
+        # reuses the icon while the file is unchanged instead of
+        # re-reading every picture from disk on every project change.
+        self._thumb_cache = {}
+        self._placeholder_icon = _placeholder_icon()
         self.engines = stills.discover_engines()
         self.fast_engine = self.engines[0]
         self.steady_engine = self.engines[1]
 
-        ram = QLabel()
-        ram.setProperty("role", "muted")
-        ram.setWordWrap(True)
-        available = machine.mem_available_mb()
-        ram.setText(
-            f"Free memory right now: about {available // 1024} GB. "
-            "Each engine needs about 3 GB while it makes a picture. "
-            "Pictures are made one at a time.")
-        self.layout.addWidget(ram)
+        self._ram_label = QLabel()
+        self._ram_label.setProperty("role", "muted")
+        self._ram_label.setWordWrap(True)
+        self._refresh_ram()
+        self.layout.addWidget(self._ram_label)
+        # The memory line stays live, like the home window's machine
+        # strip: free memory moves while a job runs.
+        self._ram_timer = QTimer(self)
+        self._ram_timer.setInterval(5000)
+        self._ram_timer.timeout.connect(self._refresh_ram)
+        self._ram_timer.start()
 
         cards = QHBoxLayout()
         self.fast_card = _EngineCard(
@@ -1928,7 +2260,8 @@ class StillsWindow(ModeWindow):
         self.make_button = DipButton("Make the missing pictures")
         self.make_button.setProperty("role", "primary")
         self.make_button.setToolTip(
-            "Make pictures for the scenes that have none yet.")
+            "Make pictures for the scenes that have none yet, and "
+            "remake pictures whose scene changed since.")
         self.make_button.clicked.connect(self._make_missing)
         row.addWidget(self.make_button)
         self.remake_button = DipButton("Remake this picture")
@@ -1938,6 +2271,19 @@ class StillsWindow(ModeWindow):
         self.remake_button.setEnabled(False)
         self.remake_button.clicked.connect(self._remake_still)
         row.addWidget(self.remake_button)
+        seed_label = QLabel("Seed:")
+        seed_label.setToolTip(
+            "Type a seed number to get the same picture back, or "
+            "leave it blank for a new random seed.")
+        row.addWidget(seed_label)
+        self.seed_edit = QLineEdit()
+        self.seed_edit.setPlaceholderText("Random")
+        self.seed_edit.setToolTip(
+            "Type a seed number to remake this picture with that "
+            "seed, or leave it blank for a new random seed.")
+        self.seed_edit.setMaximumWidth(130)
+        self.seed_edit.setClearButtonEnabled(True)
+        row.addWidget(self.seed_edit)
         self.cancel_button = DipButton("Cancel")
         self.cancel_button.setVisible(False)
         self.cancel_button.clicked.connect(self._cancel_job)
@@ -1961,9 +2307,51 @@ class StillsWindow(ModeWindow):
                             self.still_list)
         QWidget.setTabOrder(self.still_list, self.make_button)
 
+    def _refresh_ram(self):
+        """The memory line, right now, formatted like the home
+        window's machine strip ("about 407 MB", never "about 0 GB")."""
+        self._ram_label.setText(
+            f"Free memory right now: about "
+            f"{_gb_text(machine.mem_available_mb())}. "
+            "Each engine needs about 3 GB while it makes a picture. "
+            "Pictures are made one at a time.")
+
+    def _thumbnail_icon(self, still_path):
+        """The 96 px icon for a picture, cached while the file is
+        unchanged (same path, time, and size)."""
+        try:
+            stat = still_path.stat()
+        except OSError:
+            return QIcon(self._placeholder_icon)
+        key = (str(still_path), stat.st_mtime_ns, stat.st_size)
+        icon = self._thumb_cache.get(key)
+        if icon is None:
+            pixmap = QPixmap(str(still_path))
+            icon = QIcon(pixmap.scaled(
+                96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self._thumb_cache[key] = icon
+        return icon
+
+    @staticmethod
+    def _parse_seed(text):
+        """A typed seed: an int, or None for a blank field (random).
+        Raises ValueError when the text is not a whole number."""
+        text = (text or "").strip()
+        if not text:
+            return None
+        value = int(text)
+        if value < 0:
+            raise ValueError("a seed cannot be negative")
+        return value
+
     def _show_preview(self, row):
         scenes = self.state.project.scenes
         project_dir = self.state.project_dir
+        if 0 <= row < len(scenes) and scenes[row].still_seed:
+            self.seed_edit.setPlaceholderText(
+                f"Current seed {scenes[row].still_seed}")
+        else:
+            self.seed_edit.setPlaceholderText("Random")
         if 0 <= row < len(scenes):
             scene = scenes[row]
             if scene.still and project_dir is not None:
@@ -2015,16 +2403,21 @@ class StillsWindow(ModeWindow):
         self.steady_card.set_recommended(
             engine.key == self.steady_engine.key, reason)
         self.still_list.clear()
+        self._refresh_ram()
         project_dir = self.state.project_dir
-        placeholder = _placeholder_icon()
+        placeholder = self._placeholder_icon
+        seen_keys = set()
         for index, scene in enumerate(self.state.project.scenes):
             if scene.still and project_dir is not None:
                 still_path = project_dir / scene.still
                 if still_path.exists():
-                    pixmap = QPixmap(str(still_path))
-                    icon = QIcon(pixmap.scaled(
-                        96, 96, Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation))
+                    icon = self._thumbnail_icon(still_path)
+                    try:
+                        stat = still_path.stat()
+                        seen_keys.add((str(still_path),
+                                       stat.st_mtime_ns, stat.st_size))
+                    except OSError:
+                        pass
                     if scenes_mod.still_is_stale(scene, project_dir):
                         mark = "picture out of date"
                     else:
@@ -2038,7 +2431,22 @@ class StillsWindow(ModeWindow):
             item = QListWidgetItem(
                 placeholder, f"Scene {index + 1}: no picture yet")
             self.still_list.addItem(item)
-        if 0 <= row < self.still_list.count():
+        # Drop cached icons for pictures no longer listed, so the
+        # cache never holds a film's worth of dead thumbnails.
+        self._thumb_cache = {
+            key: icon for key, icon in self._thumb_cache.items()
+            if key in seen_keys
+        }
+        if not self.state.project.scenes:
+            # An empty list says what to do next instead of sitting
+            # black and blank.
+            hint = QListWidgetItem(
+                "No scenes yet. Break the idea down in the Scenes "
+                "window first.")
+            hint.setFlags(Qt.NoItemFlags)
+            self.still_list.addItem(hint)
+        if (self.state.project.scenes
+                and 0 <= row < self.still_list.count()):
             self.still_list.setCurrentRow(row)
         bar.setValue(scroll)
         todo = self._stills_to_make()
@@ -2158,6 +2566,7 @@ class StillsWindow(ModeWindow):
         project = self.state.project
         project_dir = self.state.project_dir
         paths_map = scenes_mod.ensure_project_dirs(project_dir)
+        scenes_mod.ensure_asset_ids(project.scenes)
         total = len(project.scenes)
         made = 0
         for index, scene in enumerate(project.scenes):
@@ -2167,15 +2576,29 @@ class StillsWindow(ModeWindow):
                 report("Making pictures", (index + 1) / total,
                        f"scene {index + 1} already has a picture")
                 continue
-            name = scenes_mod.scene_still_name(index)
+            if not scene.prompt or not scene.prompt.strip():
+                # A scene with no picture words cannot make a
+                # picture: the empty prompt is never sent to the
+                # engine. Work made before this scene is already
+                # saved and kept.
+                raise HicksFieldError(
+                    f"Scene {index + 1} has no picture words yet.",
+                    "Type the picture words for that scene in the "
+                    "Scenes window, then try again.")
+            name = scenes_mod.scene_still_name_for(scene, index)
             out = paths_map["stills"] / name
             # A remake keeps the recorded seed: only the prompt
-            # changed, so the picture keeps its composition.
-            seed = scene.still_seed if scene.still_seed else -1
+            # changed, so the picture keeps its composition. A
+            # first make gets a fresh explicit seed, recorded
+            # below, so the picture can be made again.
+            seed = (scene.still_seed if scene.still_seed
+                    else scenes_mod.new_seed())
+            scenes_mod.archive_previous_asset(out)
             engine.generate(scene.prompt, out, seed=seed,
                             cancel_event=cancel, force=self._force_ram)
             scene.still = f"{scenes_mod.STILLS_DIR}/{name}"
             scene.still_prompt = scene.prompt
+            scene.still_seed = seed
             made += 1
             self.state.save()
             report("Making pictures", (index + 1) / total,
@@ -2183,11 +2606,20 @@ class StillsWindow(ModeWindow):
         return made
 
     def _remake_still(self):
-        """Make a new picture for the chosen scene, with a new seed."""
+        """Make a new picture for the chosen scene: with the typed
+        seed when one is given, otherwise with a new random seed."""
         row = self.still_list.currentRow()
         scenes = self.state.project.scenes
         if not (0 <= row < len(scenes)):
             self.show_status("idle", "Pick a picture first.")
+            return
+        try:
+            typed_seed = self._parse_seed(self.seed_edit.text())
+        except ValueError:
+            self.show_status(
+                "idle",
+                "That seed is not a number. Type a whole number, or "
+                "leave the seed blank for a new random seed.")
             return
         engine = stills.preferred_engine()
         if engine is None:
@@ -2214,7 +2646,8 @@ class StillsWindow(ModeWindow):
                 f"Already busy: {self.state.job_owner}. Wait for it to "
                 "finish, or cancel it.")
             return
-        seed = random.randint(1, 2**31 - 1)
+        seed = (typed_seed if typed_seed is not None
+                else scenes_mod.new_seed())
         self.show_status(
             "working", f"Remaking the picture for scene {row + 1}.")
         self.make_button.setEnabled(False)
@@ -2236,11 +2669,20 @@ class StillsWindow(ModeWindow):
         project = self.state.project
         project_dir = self.state.project_dir
         paths_map = scenes_mod.ensure_project_dirs(project_dir)
+        scenes_mod.ensure_asset_ids(project.scenes)
         scene = project.scenes[index]
         if cancel.is_set():
             raise CancelledError()
-        name = scenes_mod.scene_still_name(index)
+        if not scene.prompt or not scene.prompt.strip():
+            # A scene with no picture words cannot make a picture:
+            # the empty prompt is never sent to the engine.
+            raise HicksFieldError(
+                f"Scene {index + 1} has no picture words yet.",
+                "Type the picture words for that scene in the "
+                "Scenes window, then try again.")
+        name = scenes_mod.scene_still_name_for(scene, index)
         out = paths_map["stills"] / name
+        scenes_mod.archive_previous_asset(out)
         engine.generate(scene.prompt, out, seed=seed,
                         cancel_event=cancel, force=self._force_ram)
         scene.still = f"{scenes_mod.STILLS_DIR}/{name}"
@@ -2285,6 +2727,18 @@ class StillsWindow(ModeWindow):
             self.show_status("working", "Stopping.")
 
 
+def _audio_output_available():
+    """True when this computer has a speaker or headphones to play
+    a line on. When the answer cannot be told, say yes: playback
+    itself reports a failure plainly."""
+    if not HAVE_MULTIMEDIA or QMediaDevices is None:
+        return False
+    try:
+        return len(QMediaDevices().audioOutputs()) > 0
+    except Exception:  # noqa: BLE001 - any probe failure means try
+        return True
+
+
 class VoiceWindow(ModeWindow):
     def __init__(self, state):
         super().__init__(state, "Voice", "voice", 850, 560)
@@ -2325,6 +2779,9 @@ class VoiceWindow(ModeWindow):
             self.voice_combo.addItem(label, voice_id)
         self.voice_combo.currentIndexChanged.connect(
             self._on_voice_picked)
+        # Keys and the wheel can switch the voice with the picker
+        # closed: the filter warns before those moves land.
+        self.voice_combo.installEventFilter(self)
         picker_row.addWidget(self.voice_combo, 1)
         card_layout.addLayout(picker_row)
         self.voice_note = QLabel()
@@ -2362,7 +2819,8 @@ class VoiceWindow(ModeWindow):
         self.make_button = DipButton("Make the spoken lines")
         self.make_button.setProperty("role", "primary")
         self.make_button.setToolTip(
-            "Speak the lines that have none yet.")
+            "Speak the lines that have none yet, and speak again the "
+            "lines whose words or voice changed.")
         self.make_button.clicked.connect(self._make_lines)
         row.addWidget(self.make_button)
         self.cancel_button = DipButton("Cancel")
@@ -2386,6 +2844,12 @@ class VoiceWindow(ModeWindow):
         QWidget.setTabOrder(self.setup_button, self.line_list)
         QWidget.setTabOrder(self.line_list, self.make_button)
 
+    def closeEvent(self, event):
+        # Stop any line playing before the window goes away, so the
+        # player is never left running past teardown.
+        self._stop_line()
+        super().closeEvent(event)
+
     def _update_voice_note(self, voice_id):
         """The picked voice's description and download size."""
         entry = voice.VOICES.get(voice_id)
@@ -2397,6 +2861,70 @@ class VoiceWindow(ModeWindow):
             f"{entry['description']} Download is about "
             f"{format_bytes(total)}.")
 
+    def eventFilter(self, watched, event):
+        # Keys and the wheel change the voice while the picker is
+        # closed, with no popup in between: warn here, before the
+        # picker moves, the way _on_voice_picked warns for a pick
+        # from the open popup.
+        if (watched is self.voice_combo
+                and not self.voice_combo.view().isVisible()
+                and self._picker_move_would_switch(event)
+                and not self._voice_switch_ok()):
+            return True
+        return super().eventFilter(watched, event)
+
+    def _picker_move_would_switch(self, event):
+        """True when this key or wheel event would move the voice
+        picker to another voice."""
+        index = self.voice_combo.currentIndex()
+        count = self.voice_combo.count()
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            if key in (Qt.Key_Up, Qt.Key_PageUp):
+                return index > 0
+            if key in (Qt.Key_Down, Qt.Key_PageDown):
+                return index < count - 1
+            if key == Qt.Key_Home:
+                return index != 0
+            if key == Qt.Key_End:
+                return index != count - 1
+            return False
+        if event.type() == QEvent.Wheel:
+            delta = event.angleDelta().y()
+            if delta == 0:
+                delta = event.pixelDelta().y()
+            if delta > 0:
+                return index > 0
+            if delta < 0:
+                return index < count - 1
+            return False
+        return False
+
+    def _fresh_spoken_lines(self):
+        """How many spoken lines match the current voice: the lines
+        a voice switch would make out of date."""
+        project_dir = self.state.project_dir
+        voice_id = self.state.project.voice
+        if project_dir is None:
+            return 0
+        return sum(
+            1 for scene in self.state.project.scenes
+            if not scenes_mod.voice_is_stale(scene, project_dir,
+                                             voice_id))
+
+    def _voice_switch_ok(self):
+        """True when switching voice may go ahead: either no spoken
+        line would go out of date, or the user said yes after being
+        warned how many would."""
+        count = self._fresh_spoken_lines()
+        if count == 0:
+            return True
+        return self.ask_yes_no(
+            "Switch voice?",
+            f"Switching voice will make {plural(count, 'spoken line')} "
+            "out of date. They will need speaking again. "
+            "Switch anyway?")
+
     def _on_voice_picked(self, _index):
         voice_id = self.voice_combo.currentData()
         if not voice_id or voice_id not in voice.VOICES:
@@ -2404,6 +2932,14 @@ class VoiceWindow(ModeWindow):
         self._update_voice_note(voice_id)
         if voice_id == self.state.project.voice:
             return
+        if self.voice_combo.view().isVisible():
+            # The picker is open: a person just picked this voice.
+            # Warn before the switch lands. A change with the picker
+            # closed comes from the keyboard or the wheel (warned in
+            # the event filter) or from code (no warning needed).
+            if not self._voice_switch_ok():
+                self._refresh()
+                return
         # A new voice makes the spoken lines out of date: they were
         # spoken in the old voice. The refresh after this marks
         # them, and the next make speaks them again.
@@ -2437,6 +2973,15 @@ class VoiceWindow(ModeWindow):
                 "idle",
                 "Playing lines needs the media pieces, which this "
                 "build does not have.")
+            return
+        if not _audio_output_available():
+            # No speaker or headphones: starting playback anyway
+            # hangs the app at teardown on such a machine (the
+            # player never closes). Say so plainly instead.
+            self.show_status(
+                "idle",
+                "No speaker or headphones were found on this "
+                "computer, so the line cannot play here.")
             return
         self._player.setSource(QUrl.fromLocalFile(str(audio_path)))
         self._audio.setVolume(1.0)
@@ -2553,6 +3098,20 @@ class VoiceWindow(ModeWindow):
                    if scenes_mod.voice_is_stale(scene, project_dir,
                                                 voice_id))
 
+    def _needs_voice(self):
+        """True when some spoken line still needs a voice: a line
+        with words in it that is missing or out of date. Empty lines
+        are silence and need no voice."""
+        project_dir = self.state.project_dir
+        voice_id = self.state.project.voice
+        if project_dir is None:
+            return any(scene.narration.strip()
+                       for scene in self.state.project.scenes)
+        return any(scene.narration.strip()
+                   and scenes_mod.voice_is_stale(scene, project_dir,
+                                                 voice_id)
+                   for scene in self.state.project.scenes)
+
     def _setup_voice(self):
         if not self.state.try_job("Setting up the voice"):
             self.show_status(
@@ -2609,11 +3168,12 @@ class VoiceWindow(ModeWindow):
             self.show_status(
                 "idle", "All spoken lines are already made.")
             return
-        ready, _status = voice.is_ready(self.state.project.voice)
-        if not ready:
-            self.show_status(
-                "idle", "Set up the voice first.")
-            return
+        if self._needs_voice():
+            ready, _status = voice.is_ready(self.state.project.voice)
+            if not ready:
+                self.show_status(
+                    "idle", "Set up the voice first.")
+                return
         if not self.state.try_job("Speaking the lines"):
             self.show_status(
                 "error",
@@ -2637,6 +3197,7 @@ class VoiceWindow(ModeWindow):
         project = self.state.project
         project_dir = self.state.project_dir
         paths_map = scenes_mod.ensure_project_dirs(project_dir)
+        scenes_mod.ensure_asset_ids(project.scenes)
         total = len(project.scenes)
         made = 0
         for index, scene in enumerate(project.scenes):
@@ -2647,7 +3208,7 @@ class VoiceWindow(ModeWindow):
                 report("Speaking the lines", (index + 1) / total,
                        f"scene {index + 1} already spoken")
                 continue
-            name = scenes_mod.scene_audio_name(index)
+            name = scenes_mod.scene_audio_name_for(scene, index)
             out = paths_map["audio"] / name
             voice.synthesize(scene.narration, out, cancel_event=cancel,
                              voice_id=project.voice)
@@ -2720,6 +3281,9 @@ class ExportWindow(ModeWindow):
         # and an unchanged film is never re-extracted.
         self._poster_film = None
         self._poster_pixmap = None
+        # True when the film exists but its first frame could not be
+        # taken: the player area says so instead of staying black.
+        self._poster_failed = False
         if HAVE_MULTIMEDIA:
             self._player = QMediaPlayer(self)
             self._audio = QAudioOutput(self)
@@ -2761,6 +3325,16 @@ class ExportWindow(ModeWindow):
         self.engine_note.setProperty("role", "muted")
         self.engine_note.setWordWrap(True)
         self.layout.addWidget(self.engine_note)
+        self.open_stills_button = DipButton("Open Stills")
+        self.open_stills_button.setToolTip(
+            "Open the Stills window to set up a picture engine.")
+        self.open_stills_button.clicked.connect(
+            lambda: self.state.open_window_requested.emit("stills"))
+        self.open_stills_button.setVisible(False)
+        stills_row = QHBoxLayout()
+        stills_row.addWidget(self.open_stills_button)
+        stills_row.addStretch(1)
+        self.layout.addLayout(stills_row)
         row = QHBoxLayout()
         self.fast_build = DipButton("Build with the fast engine")
         self.fast_build.setProperty("role", "primary")
@@ -2839,9 +3413,19 @@ class ExportWindow(ModeWindow):
         self.poster_label = _StillPreview()
         self.poster_label.setMinimumHeight(240)
         self.poster_label.setToolTip("The first frame of the film.")
+        # The note shown when the film is fine but its first frame
+        # could not be taken: the player area must say so instead
+        # of staying black and silent.
+        self.poster_note = QLabel(
+            "No preview frame. The film itself is fine.")
+        self.poster_note.setProperty("role", "muted")
+        self.poster_note.setWordWrap(True)
+        self.poster_note.setAlignment(Qt.AlignCenter)
+        self.poster_note.setMinimumHeight(240)
         self._player_stack = QStackedWidget()
         self._player_stack.addWidget(self.video_widget)
         self._player_stack.addWidget(self.poster_label)
+        self._player_stack.addWidget(self.poster_note)
         player_layout.addWidget(self._player_stack)
         controls = QHBoxLayout()
         self.play_button = DipButton("Play")
@@ -2901,11 +3485,14 @@ class ExportWindow(ModeWindow):
                 == QMediaPlayer.PlayingState)
 
     def _show_poster(self):
-        """Show the film's first frame. Without a poster held, the
-        player surface shows instead: black, and silent about it."""
+        """Show the film's first frame. When the frame could not be
+        taken, say so in the player area instead of leaving it black
+        and silent; with no film at all, the player surface shows."""
         if self._poster_pixmap is not None:
             self.poster_label.set_pixmap(self._poster_pixmap)
             self._player_stack.setCurrentWidget(self.poster_label)
+        elif self._poster_failed:
+            self._player_stack.setCurrentWidget(self.poster_note)
         else:
             self._player_stack.setCurrentWidget(self.video_widget)
 
@@ -2914,12 +3501,13 @@ class ExportWindow(ModeWindow):
 
     def _update_poster(self, film):
         """Hold the film's first frame as the poster, taking it once
-        per film. A film that cannot give up a frame leaves the
-        player as it was. While the film plays, the player stays in
-        front: the poster is for idle only."""
+        per film. A film that cannot give up a frame gets a plain
+        note in the player area. While the film plays, the player
+        stays in front: the poster is for idle only."""
         if film is None or not film.exists():
             self._poster_film = None
             self._poster_pixmap = None
+            self._poster_failed = False
             self._show_video()
             return
         try:
@@ -2930,6 +3518,7 @@ class ExportWindow(ModeWindow):
         if key != self._poster_film:
             self._poster_film = key
             self._poster_pixmap = None
+            self._poster_failed = False
             # The frame is taken into the film's own folder, where
             # there is room, and removed once the picture is held.
             tmp_path = film.with_name(f".{film.stem}-poster.png")
@@ -2944,6 +3533,7 @@ class ExportWindow(ModeWindow):
                     tmp_path.unlink()
                 except OSError:
                     pass
+            self._poster_failed = self._poster_pixmap is None
         if not self._is_playing():
             self._show_poster()
 
@@ -2983,7 +3573,10 @@ class ExportWindow(ModeWindow):
             "idle", "The film preview could not start here. "
             "Use Open the film instead.")
 
-    def _refresh(self):
+    def _refresh_summary(self):
+        """The "What is ready" counts, from the project as it is now.
+        Called on every refresh, and from build progress, so the
+        summary moves as the build lands pieces."""
         project = self.state.project
         project_dir = self.state.project_dir
         count = len(project.scenes)
@@ -3006,6 +3599,56 @@ class ExportWindow(ModeWindow):
             f"{plural(stills_ready, 'picture')} ready. "
             f"{plural(voice_ready, 'spoken line')} ready. "
             f"{plural(clips_ready, 'moving clip')} ready.")
+
+    def _stills_needed(self):
+        """True when some picture still needs making."""
+        project_dir = self.state.project_dir
+        if project_dir is None:
+            return bool(self.state.project.scenes)
+        return any(scenes_mod.still_is_stale(scene, project_dir)
+                   for scene in self.state.project.scenes)
+
+    def _voice_needed(self):
+        """True when some spoken line still needs a voice: a line
+        with words in it that is missing or out of date. A film with
+        no spoken lines needs no voice."""
+        project_dir = self.state.project_dir
+        voice_id = self.state.project.voice
+        if project_dir is None:
+            return any(scene.narration.strip()
+                       for scene in self.state.project.scenes)
+        return any(scene.narration.strip()
+                   and scenes_mod.voice_is_stale(scene, project_dir,
+                                                 voice_id)
+                   for scene in self.state.project.scenes)
+
+    @staticmethod
+    def _engine_word(engine):
+        return "fast" if engine.key == "fastsd" else "steady"
+
+    def _build_button_tip(self, engine, ready, stills_needed,
+                          count, version, building):
+        """Why this build button is greyed out, or what it does when
+        it is not: the reason lives on the button itself."""
+        if building:
+            return "A build is already running."
+        if count == 0:
+            return ("There are no scenes yet. Break the idea into "
+                    "scenes first.")
+        if version is None:
+            return ("ffmpeg is missing. Use the Install ffmpeg "
+                    "button above.")
+        if not ready and stills_needed:
+            return (f"The {self._engine_word(engine)} engine is not "
+                    "set up yet. Open Stills and press Set up.")
+        return (f"Build the film, making pictures with the "
+                f"{self._engine_word(engine)} engine.")
+
+    def _refresh(self):
+        self._refresh_summary()
+        project = self.state.project
+        project_dir = self.state.project_dir
+        count = len(project.scenes)
         version = video.ffmpeg_version_short()
         if version:
             self.ffmpeg_label.setText(
@@ -3020,12 +3663,46 @@ class ExportWindow(ModeWindow):
         engines = stills.discover_engines()
         fast_ready, _s = engines[0].is_ready()
         steady_ready, _s = engines[1].is_ready()
-        self.fast_build.setEnabled(bool(count) and fast_ready
-                                   and version is not None)
-        self.steady_build.setEnabled(bool(count) and steady_ready
-                                     and version is not None)
+        stills_needed = self._stills_needed()
+        building = self._worker is not None
+        if not building:
+            # A build button is enabled when its engine is ready, or
+            # when no picture needs making: pictures already ready
+            # are not blocked by an engine that is not needed.
+            # While a build runs, the buttons stay as _build left
+            # them: a refresh mid-build must not switch them on.
+            self.fast_build.setEnabled(
+                bool(count) and version is not None
+                and (fast_ready or not stills_needed))
+            self.steady_build.setEnabled(
+                bool(count) and version is not None
+                and (steady_ready or not stills_needed))
+        self.fast_build.setToolTip(
+            self._build_button_tip(engines[0], fast_ready,
+                                   stills_needed, count, version,
+                                   building))
+        self.steady_build.setToolTip(
+            self._build_button_tip(engines[1], steady_ready,
+                                   stills_needed, count, version,
+                                   building))
         engine, reason = stills.recommended_engine()
-        self.engine_note.setText(reason)
+        if not fast_ready and not steady_ready:
+            # No engine at all: say what is missing and where to fix
+            # it, with a button that goes there.
+            if stills_needed:
+                self.engine_note.setText(
+                    "No picture engine is set up yet. Open Stills "
+                    "and press Set up.")
+            else:
+                self.engine_note.setText(
+                    "No picture engine is set up yet, but every "
+                    "picture is already made, so the film can still "
+                    "be built. To make new pictures, open Stills "
+                    "and press Set up.")
+            self.open_stills_button.setVisible(True)
+        else:
+            self.engine_note.setText(reason)
+            self.open_stills_button.setVisible(False)
         self.fast_build.setText(
             "Build with the fast engine (recommended)"
             if engine.key == engines[0].key
@@ -3084,34 +3761,48 @@ class ExportWindow(ModeWindow):
                 "idle", "There are no scenes yet. Break the idea into "
                 "scenes first.")
             return
-        ready, status = engine.is_ready()
-        if not ready:
-            self.show_status("idle", f"{engine.label} is not ready: "
-                             f"{status}")
-            return
-        voice_ready, _s = voice.is_ready(project.voice)
-        if not voice_ready:
+        stills_needed = self._stills_needed()
+        ready, _status = engine.is_ready()
+        if not ready and stills_needed:
+            # The engine is only needed when a picture still needs
+            # making; pictures already ready build without it.
             self.show_status(
-                "idle", "Set up the voice first, in the Voice window.")
+                "idle",
+                f"The {self._engine_word(engine)} engine is not set "
+                "up yet. Open Stills and press Set up.")
             return
+        if self._voice_needed():
+            # A film with no spoken lines needs no voice: empty
+            # lines are silence, and lines already spoken are kept.
+            voice_ready, _s = voice.is_ready(project.voice)
+            if not voice_ready:
+                self.show_status(
+                    "idle",
+                    "Set up the voice first, in the Voice window.")
+                return
         if video.find_ffmpeg() is None:
             self.show_status(
                 "error",
                 "ffmpeg is missing. Use the Install ffmpeg button "
                 "above.")
             return
-        try:
-            engine.check_ram()
-            self._force_ram = False
-        except RamShortError as exc:
-            if not self.ask_yes_no(
-                    "Memory is short",
-                    f"{exc}. Build anyway? The computer may slow down "
-                    "while the film is built."):
-                self.show_status("idle", "Left it. Free some memory "
-                                 "and try again.")
-                return
+        if not stills_needed:
+            # No picture to make: the engine runs nothing, so its
+            # memory is not needed either.
             self._force_ram = True
+        else:
+            try:
+                engine.check_ram()
+                self._force_ram = False
+            except RamShortError as exc:
+                if not self.ask_yes_no(
+                        "Memory is short",
+                        f"{exc}. Build anyway? The computer may slow "
+                        "down while the film is built."):
+                    self.show_status("idle", "Left it. Free some "
+                                     "memory and try again.")
+                    return
+                self._force_ram = True
         if not self.state.try_job("Building the film"):
             self.show_status(
                 "error",
@@ -3123,6 +3814,8 @@ class ExportWindow(ModeWindow):
         self.show_status("working", "Building the film.")
         self.fast_build.setEnabled(False)
         self.steady_build.setEnabled(False)
+        self.fast_build.setToolTip("A build is already running.")
+        self.steady_build.setToolTip("A build is already running.")
         self.cancel_button.setVisible(True)
         self.progress.setVisible(True)
         self.progress.setRange(0, 100)
@@ -3156,9 +3849,22 @@ class ExportWindow(ModeWindow):
         text = label + (f": {detail}" if detail else "")
         self.step_label.setText(text)
         self.show_status("working", text)
+        # The build saves as pieces land: count what is ready now,
+        # so the summary moves with the build.
+        self._refresh_summary()
 
-    def _finish_ui(self):
+    def _finish_ui(self, verb="Took"):
         self._timer.stop()
+        if self._started is not None:
+            # The build is over: "Time so far" becomes how long it
+            # took, and the step label clears instead of lingering
+            # on the last step as if the job were still running.
+            elapsed = int(time.time() - self._started)
+            minutes, seconds = divmod(elapsed, 60)
+            self.elapsed_label.setText(
+                f"{verb} {minutes}m {seconds:02d}s.")
+            self._started = None
+        self.step_label.setText("")
         self._worker = None
         self.fast_build.setEnabled(True)
         self.steady_build.setEnabled(True)
@@ -3181,7 +3887,7 @@ class ExportWindow(ModeWindow):
         self.show_status("done", "Film ready.")
 
     def _on_error(self, exc):
-        self._finish_ui()
+        self._finish_ui("Stopped after")
         if isinstance(exc, CancelledError):
             self.show_status("idle", "Stopped. Work made so far is "
                              "kept.")

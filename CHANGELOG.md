@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.4.0 (2026-11-16)
+
+The full third task list (task list 3, items 1-48): the breakdown
+fix that actually works this time, plus the recent-films crash,
+Undo safety, silent scenes, the Export dead ends, and the rest.
+
+- The breakdown no longer dies when the model goes quiet for more
+  than 10 seconds. The read loop was reworked so a quiet stretch is
+  just waiting: the 120-second silence limit and the "still
+  waiting" heartbeat now work as designed, and a raw socket error
+  is never shown.
+- A model that is still loading is no longer reported as "Ollama is
+  not running". The first answer gets the same waiting time as the
+  rest of the stream, and the window says the model is still
+  loading while it waits.
+- A dropped connection mid-breakdown is reported plainly instead
+  of showing a raw error.
+- The recent-films menu no longer crashes on the second film or
+  shows the folder path split into one-letter entries. It shows
+  enough of the path to tell same-named films apart, and entries
+  for deleted folders are dropped.
+- Reordering scenes then remaking a picture can no longer overwrite
+  a different scene's picture: each scene keeps its own picture,
+  spoken line, and clip.
+- Undo is safe now: it is cleared when the film changes, a snapshot
+  is saved before every change (including adding and moving
+  scenes, and replacing scenes with a breakdown), and the button
+  greys out when there is nothing to undo.
+- Edits typed in a scene are no longer thrown away when the film
+  is switched.
+- A scene with no spoken line stays silent instead of breaking the
+  whole job, as the help already promised. An empty prompt is no
+  longer sent to the picture engine.
+- The home "Break into scenes" button now does what it says, and
+  the Scenes Break button is disabled until a model is picked.
+- The installer sets the executable bits on the installed scripts,
+  so the first run does not depend on the repo's file modes; the
+  README documents the right-click "Allow Launching" path for a
+  fresh clone.
+- The home tiles and Scenes rows count out-of-date pictures the
+  same way Stills, Voice, and Export do.
+- The Export "what is ready" summary refreshes as the build goes,
+  instead of freezing at zero.
+- The Scenes window shows the current idea, not the one it had when
+  it opened.
+- Old spoken lines go out of date when the voice changes, like new
+  ones do, and switching voices warns first when spoken lines
+  exist.
+- Remake keeps the old picture instead of destroying it.
+- The picture engine no longer silently reuses a previous run's
+  picture when it makes nothing.
+- Cancel now lands during long setup steps: the voice install, the
+  picture download, and the engine download can all be stopped.
+- Export says what is missing and where to fix it when no picture
+  engine is set up, with a button that opens Stills. Pictures
+  already ready are no longer blocked by an engine that isn't
+  needed for them.
+- The steady picture engine setup offers a one-click install for
+  git and cmake instead of terminal commands.
+- The installer looks like the app, has a Cancel button during the
+  install, and the libEGL warning reads correctly.
+- If the app cannot start, a message is shown instead of the menu
+  icon silently doing nothing.
+- The home checklist gives Ollama more time before marking it down.
+- A silent film no longer needs a voice set up.
+- First-made pictures record their seed, and a seed can be typed
+  on remake to get a picture back.
+- The Stills memory line refreshes live, like the home window's.
+- Voice Play says plainly there is no speaker instead of hanging
+  when the app closes.
+- Checking models shows progress, and Refresh can't be double
+  pressed into two checks.
+- The recommended model is the best one that fits, not the
+  smallest, and fit is judged on free memory, not total memory.
+- The scenes list adds each arriving scene instead of rebuilding
+  itself, and scene rows show their camera move.
+- Stills caches thumbnails instead of reloading them from disk on
+  every change.
+- Build buttons explain on the button itself why they are grey.
+- Empty lists carry a short hint saying what to do next.
+- The picture engine download is verified, shows progress, and can
+  be cancelled.
+- The words pass: tooltips, help topics, the README, and error
+  hints that were stale or wrong now say true things.
+- The debug report has a Refresh button.
+- After a build finishes, Export says how long it took and clears
+  the step line.
+- A failed preview frame says so instead of leaving a black box.
+- A timeout says it timed out instead of reporting an error.
+- The dead code is gone, and the film name and dates are shown
+  instead of lying in the file.
+
 ## 0.3.0 (2026-11-15)
 
 The full second task list (task list 2, items 1-18): the real-PC

@@ -20,7 +20,7 @@ class ErrorTests(unittest.TestCase):
 
     def test_ffmpeg_error_names_the_fix(self):
         err = FFmpegMissingError()
-        self.assertIn("installer", err.plain_text().lower())
+        self.assertIn("install ffmpeg", err.plain_text().lower())
         self.assertNotIn("sudo apt", err.plain_text())
         self.assertIn("ffmpeg", err.message.lower())
 

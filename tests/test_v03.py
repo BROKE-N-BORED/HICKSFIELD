@@ -148,8 +148,12 @@ class RecommendedModelTests(unittest.TestCase):
 
     def test_unknown_capabilities_count_as_able(self):
         unknown = {"name": "mystery:2b", "size": 1000000000}
-        best = ollama.recommended_model([unknown, self.SMALL], 8192)
+        # Unknown still counts as able: alone, it is recommended.
+        best = ollama.recommended_model([unknown], 8192)
         self.assertEqual(best["name"], "mystery:2b")
+        # But the best model that fits wins over an unknown one.
+        best = ollama.recommended_model([unknown, self.SMALL], 8192)
+        self.assertEqual(best["name"], "small:2b")
 
 
 class _FakeStream:
@@ -302,6 +306,10 @@ class ModelPickerGuiTests(GuiBase):
             machine, "mem_total_mb", return_value=8192)
         self._mem_patch.start()
         self.addCleanup(self._mem_patch.stop)
+        self._mem_free_patch = mock.patch.object(
+            machine, "mem_available_mb", return_value=8192)
+        self._mem_free_patch.start()
+        self.addCleanup(self._mem_free_patch.stop)
 
     def _ready_window(self):
         self.state.project.idea = "A stool in a workshop."
@@ -966,6 +974,10 @@ class SceneLengthGuiTests(GuiBase):
             machine, "mem_total_mb", return_value=8192)
         self._mem_patch.start()
         self.addCleanup(self._mem_patch.stop)
+        self._mem_free_patch = mock.patch.object(
+            machine, "mem_available_mb", return_value=8192)
+        self._mem_free_patch.start()
+        self.addCleanup(self._mem_free_patch.stop)
 
     def _ready_window(self):
         self.state.project.idea = "A stool in a workshop."
@@ -1191,7 +1203,7 @@ class PosterGuiTests(GuiBase):
         self.assertIs(window._player_stack.currentWidget(),
                       window.poster_label)
 
-    def test_failed_extraction_stays_black_and_silent(self):
+    def test_failed_extraction_shows_a_note(self):
         if video.find_ffmpeg() is None:
             self.skipTest("ffmpeg not installed")
         self._film()
@@ -1200,5 +1212,6 @@ class PosterGuiTests(GuiBase):
             window = self._show(ExportWindow)
         self.assertIsNone(window._poster_pixmap)
         self.assertIs(window._player_stack.currentWidget(),
-                      window.video_widget)
+                      window.poster_note)
+        self.assertIn("No preview frame", window.poster_note.text())
         self.assertEqual(window.status_label.text(), "Ready.")

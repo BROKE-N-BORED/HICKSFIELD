@@ -29,8 +29,8 @@ class FFmpegMissingError(HicksFieldError):
     def __init__(self):
         super().__init__(
             "ffmpeg is not installed on this computer.",
-            "Run the HicksField installer again. It installs ffmpeg "
-            "for you.",
+            "Open the Export window and press Install ffmpeg. It "
+            "installs ffmpeg for you.",
         )
 
 

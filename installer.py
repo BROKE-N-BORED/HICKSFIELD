@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 # sysdeps uses only the standard library, so it is safe to import
@@ -33,6 +34,68 @@ APP_NAME = "HicksField"
 INSTALL_DIR_NAME = "hicksfield-app"
 ICON_SIZES = (16, 32, 48, 64, 128, 256)
 PIP_TIMEOUT_S = 900
+
+# Midnight Cinema, kept in step with hicksfield/style.py. The
+# installer cannot import the app's style module: it runs before the
+# app's Python home exists, so the palette is copied here.
+BG = "#171210"
+PANEL = "#221b17"
+PANEL_LIGHT = "#2b211b"
+BORDER = "#3d3129"
+TEXT = "#f2e9d8"
+MUTED = "#b3a48e"
+BRASS = "#d9a441"
+BRASS_HOVER = "#e8b95c"
+BRASS_TEXT = "#1d150a"
+LOG_BG = "#1a130f"
+
+# The installed files that must be executable: the menu entry runs
+# run.sh, and the installer itself must double-click.
+EXECUTABLE_FILES = ("install.sh", "run.sh", "installer.py")
+
+# System libraries the window toolkit needs, and the apt package
+# that provides each one on Debian/Ubuntu. Only libraries the
+# installer knows how to provide are listed: an unknown library
+# gets a plain warning instead of a guessed package name.
+QT_LIB_PACKAGES = {
+    "libEGL.so": "libegl1",
+    "libGL.so": "libgl1",
+    "libxkbcommon.so": "libxkbcommon0",
+    "libdbus-1.so": "libdbus-1-3",
+    "libfontconfig.so": "libfontconfig1",
+    "libglib-2.0.so": "libglib2.0-0",
+    "libstdc++.so": "libstdc++6",
+    "libgcc_s.so": "libgcc-s1",
+}
+
+
+class InstallCancelled(Exception):
+    """The user pressed Cancel. Not an error: the GUI reports it
+    plainly and the Install button stays available."""
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise InstallCancelled()
+
+
+def _qt_lib_package(lib_name):
+    """The apt package for a missing library, or None when the
+    installer does not know which package provides it."""
+    base = lib_name.split(".so")[0] + ".so"
+    return QT_LIB_PACKAGES.get(base)
+
+
+def _display_path(path):
+    """A path for the window: home shown as ~, so the default install
+    path fits on one line instead of wrapping mid-word."""
+    text = str(path)
+    home = str(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
 
 
 class InstallError(Exception):
@@ -55,12 +118,35 @@ def default_target():
     return Path.home() / ".local" / "share" / INSTALL_DIR_NAME
 
 
-def run(cmd, cwd=None, timeout=300, env=None):
-    proc = subprocess.run(
+def run(cmd, cwd=None, timeout=300, env=None, cancel_event=None):
+    if cancel_event is None:
+        proc = subprocess.run(
+            [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    # Cancellable run: poll the process so Cancel can kill it
+    # instead of waiting out a minutes-long step.
+    proc = subprocess.Popen(
         [str(c) for c in cmd], cwd=str(cwd) if cwd else None,
-        capture_output=True, text=True, timeout=timeout, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env,
     )
-    return proc.returncode, proc.stdout, proc.stderr
+    deadline = time.monotonic() + timeout
+    while True:
+        if cancel_event.is_set():
+            proc.kill()
+            proc.wait()
+            raise InstallCancelled()
+        try:
+            out, err = proc.communicate(timeout=0.2)
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired:
+            pass
+        if time.monotonic() > deadline:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(cmd, timeout)
 
 
 def copy_tree(src, target, log):
@@ -82,6 +168,25 @@ def copy_tree(src, target, log):
     log(f"Copied {count} files to {target}.")
 
 
+def set_installed_modes(target, log=None):
+    """Make the installed scripts executable.
+
+    The repo cannot be relied on to carry exec bits (a clone or a
+    source archive may arrive 644), so the installer sets them on
+    the installed copies: the menu entry runs run.sh, and the
+    installer itself must double-click.
+    """
+    made = 0
+    for name in EXECUTABLE_FILES:
+        path = Path(target) / name
+        if not path.exists():
+            continue
+        path.chmod(path.stat().st_mode | 0o111)
+        made += 1
+    if made and log is not None:
+        log(f"Made {made} installed scripts executable.")
+
+
 def install_system_deps(log, warnings):
     """Install ffmpeg and the Python venv package, if missing.
 
@@ -101,10 +206,11 @@ def install_system_deps(log, warnings):
     warnings.extend(sysdeps.install_missing_packages(progress_cb=log))
 
 
-def make_venv(target, log):
+def make_venv(target, log, cancel_event=None):
     venv_dir = target / "venv"
     code, _out, _err = run(
-        [sys.executable, "-m", "venv", str(venv_dir)], timeout=300)
+        [sys.executable, "-m", "venv", str(venv_dir)], timeout=300,
+        cancel_event=cancel_event)
     python = venv_dir / "bin" / "python"
     if code != 0 or not python.exists():
         # The stderr tail is not shown: on a missing venv package it
@@ -120,12 +226,12 @@ def make_venv(target, log):
     return python
 
 
-def install_deps(venv_python, log):
+def install_deps(venv_python, log, cancel_event=None):
     log("Installing the window toolkit (PySide6). This takes a bit.")
     code, _out, err = run(
         [venv_python, "-m", "pip", "install", "--quiet",
          "PySide6>=6.6"],
-        timeout=PIP_TIMEOUT_S,
+        timeout=PIP_TIMEOUT_S, cancel_event=cancel_event,
     )
     if code != 0:
         raise InstallError(
@@ -161,7 +267,7 @@ print("icons ok")
 """
 
 
-def render_icons(venv_python, src, log, warnings):
+def render_icons(venv_python, src, log, warnings, cancel_event=None):
     """Render the PNG icons. Non-fatal: a failed render only warns."""
     svg = src / "icons" / "hicksfield.svg"
     if not svg.exists():
@@ -174,6 +280,7 @@ def render_icons(venv_python, src, log, warnings):
             [venv_python, "-c", RENDER_SCRIPT, str(svg), str(icons_root)],
             timeout=120,
             env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            cancel_event=cancel_event,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         warnings.append(f"Could not render the icons ({exc}). The menu "
@@ -207,20 +314,16 @@ def write_desktop(target, log):
     log("Menu entry written.")
 
 
-_MISSING_LIB_RE = re.compile(r"(lib\S+\.so\S*)")
+# A missing library name, without trailing punctuation: the old
+# `lib\S+\.so\S*` captured the colon in "libEGL.so.1: cannot open",
+# so the warning read "libEGL.so.1: is missing".
+_MISSING_LIB_RE = re.compile(r"(lib\S+?\.so(?:\.\d+)*)")
 
 
-def verify(target, venv_python, log, warnings):
-    code, out, err = run(
-        [venv_python, "-m", "hicksfield", "--version"],
-        cwd=target, timeout=120,
-    )
-    if code != 0 or "HicksField" not in out:
-        raise InstallError(
-            "The install did not work: the app would not start.",
-            f"Last lines: {(err or out).strip().splitlines()[-1:]}",
-        )
-    log(f"App starts: {out.strip()}")
+def _check_window(target, venv_python, cancel_event=None):
+    """Run the window toolkit smoke test. Returns ("ok", "") when the
+    toolkit starts, ("failed", stderr) when it fails, and
+    ("uncheckable", reason) when the check itself could not run."""
     smoke = (
         "from PySide6.QtWidgets import QApplication\n"
         "app = QApplication([])\n"
@@ -230,44 +333,101 @@ def verify(target, venv_python, log, warnings):
         code, _out, err = run(
             [venv_python, "-c", smoke], cwd=target, timeout=120,
             env={**os.environ, "QT_QPA_PLATFORM": "offscreen"},
+            cancel_event=cancel_event,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        warnings.append(f"Could not check the window toolkit ({exc}).")
-        return
-    if code != 0:
-        match = _MISSING_LIB_RE.search(err or "")
-        if match:
-            warnings.append(
-                "The app is installed, but its window may not open on "
-                "this computer: the system library "
-                f"{match.group(1)} is missing. Install the Qt system "
-                "libraries for your Linux version and try again.")
-        else:
-            warnings.append(
-                "The app is installed, but the window check failed. "
-                f"Last lines: {err.strip().splitlines()[-1:]}")
-        return
-    log("Window toolkit check passed.")
+        return "uncheckable", str(exc)
+    if code == 0:
+        return "ok", ""
+    return "failed", err or ""
 
 
-def install(target, log, progress):
+def verify(target, venv_python, log, warnings, cancel_event=None):
+    code, out, err = run(
+        [venv_python, "-m", "hicksfield", "--version"],
+        cwd=target, timeout=120, cancel_event=cancel_event,
+    )
+    if code != 0 or "HicksField" not in out:
+        raise InstallError(
+            "The install did not work: the app would not start.",
+            f"Last lines: {(err or out).strip().splitlines()[-1:]}",
+        )
+    log(f"App starts: {out.strip()}")
+    status, detail = _check_window(target, venv_python, cancel_event)
+    if status == "ok":
+        log("Window toolkit check passed.")
+        return
+    if status == "uncheckable":
+        warnings.append(f"Could not check the window toolkit ({detail}).")
+        return
+    match = _MISSING_LIB_RE.search(detail)
+    if match is None:
+        warnings.append(
+            "The app is installed, but the window check failed. "
+            f"Last lines: {detail.strip().splitlines()[-1:]}")
+        return
+    lib = match.group(1)
+    package = _qt_lib_package(lib)
+    if package is None:
+        # No known package for this library: say so plainly instead
+        # of guessing a name or sending the user to a terminal.
+        warnings.append(
+            "The app is installed, but its window may not open on "
+            "this computer: the system library "
+            f"{lib} is missing. The installer does not know which "
+            "system package provides it on this Linux version, so "
+            "it could not install it.")
+        return
+    # A missing Qt system library is fixed in place: install it
+    # (one permission window) and check the window once more.
+    log(f"The window check needs the system library {lib}. "
+        "Installing it now. A permission window will ask for your "
+        "password.")
+    error = sysdeps.install_packages([package], progress_cb=log)
+    if error is not None:
+        warnings.append(
+            "The app is installed, but its window may not open on "
+            "this computer: the system library "
+            f"{lib} is missing, and it could not be installed: "
+            f"{error}. Run the installer again and allow the "
+            "permission step when it asks.")
+        return
+    status, detail = _check_window(target, venv_python, cancel_event)
+    if status == "ok":
+        log("Window toolkit check passed.")
+        return
+    match = _MISSING_LIB_RE.search(detail)
+    if match is not None:
+        lib = match.group(1)
+    warnings.append(
+        "The app is installed, but its window may not open on this "
+        f"computer: the system library {lib} is still missing. Run "
+        "the installer again and try again.")
+
+
+def install(target, log, progress, cancel_event=None):
     """Run the whole install. Returns a list of warnings (possibly
-    empty). Raises InstallError on failure."""
+    empty). Raises InstallError on failure, InstallCancelled when
+    the user cancels."""
     warnings = []
     src = source_dir()
     progress(0.05)
     install_system_deps(log, warnings)
+    _check_cancel(cancel_event)
     progress(0.1)
     copy_tree(src, target, log)
+    set_installed_modes(target, log)
+    _check_cancel(cancel_event)
     progress(0.25)
-    venv_python = make_venv(target, log)
+    venv_python = make_venv(target, log, cancel_event)
     progress(0.3)
-    install_deps(venv_python, log)
+    install_deps(venv_python, log, cancel_event)
     progress(0.7)
-    render_icons(venv_python, src, log, warnings)
+    render_icons(venv_python, src, log, warnings, cancel_event)
+    _check_cancel(cancel_event)
     progress(0.85)
     write_desktop(target, log)
-    verify(target, venv_python, log, warnings)
+    verify(target, venv_python, log, warnings, cancel_event)
     progress(1.0)
     return warnings
 
@@ -296,6 +456,9 @@ def run_gui(target):
     from tkinter import messagebox, scrolledtext, ttk
 
     messages = queue.Queue()
+    cancel_event = threading.Event()
+    # Mutable holder: True while the worker is installing.
+    running = {"installing": False}
 
     def _log(message):
         messages.put(("log", message))
@@ -305,7 +468,11 @@ def run_gui(target):
 
     def _worker():
         try:
-            warnings = install(target, _log, _progress)
+            warnings = install(target, _log, _progress,
+                               cancel_event=cancel_event)
+        except InstallCancelled:
+            messages.put(("cancelled", None))
+            return
         except InstallError as exc:
             messages.put(("failed", exc.plain_text()))
             return
@@ -316,18 +483,56 @@ def run_gui(target):
 
     root = tk.Tk()
     root.title("Install HicksField")
-    root.geometry("560x420")
+    root.geometry("560x440")
     root.resizable(False, False)
+    root.configure(background=BG)
+
+    # Midnight Cinema: dark room, warm projector light, brass.
+    # The clam theme takes colours predictably; without it the
+    # defaults show and the window still works.
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("TFrame", background=BG)
+    style.configure("TLabel", background=BG, foreground=TEXT)
+    style.configure("Title.TLabel", background=BG, foreground=BRASS,
+                    font=("TkDefaultFont", 18, "bold"))
+    style.configure("Muted.TLabel", background=BG, foreground=MUTED)
+    style.configure("TButton", background=PANEL_LIGHT, foreground=TEXT,
+                    bordercolor=BORDER, lightcolor=PANEL_LIGHT,
+                    darkcolor=PANEL_LIGHT, padding=6)
+    style.map("TButton",
+              background=[("active", BORDER)],
+              foreground=[("disabled", MUTED)])
+    style.configure("Brass.TButton", background=BRASS,
+                    foreground=BRASS_TEXT, bordercolor=BRASS,
+                    lightcolor=BRASS, darkcolor=BRASS, padding=6)
+    style.map("Brass.TButton",
+              background=[("active", BRASS_HOVER),
+                          ("disabled", PANEL_LIGHT)],
+              foreground=[("disabled", MUTED)])
+    style.configure("TProgressbar", background=BRASS,
+                    troughcolor=PANEL_LIGHT, bordercolor=BORDER,
+                    lightcolor=BRASS, darkcolor=BRASS)
 
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill=tk.BOTH, expand=True)
     ttk.Label(frame, text="HicksField",
-              font=("TkDefaultFont", 18, "bold")).pack(anchor=tk.W)
-    ttk.Label(frame, text=f"Installs into {target}",
+              style="Title.TLabel").pack(anchor=tk.W)
+    ttk.Label(frame, text="A free local film studio",
+              style="Muted.TLabel").pack(anchor=tk.W)
+    ttk.Label(frame, text=f"Installs into {_display_path(target)}",
+              style="Muted.TLabel",
               wraplength=520).pack(anchor=tk.W, pady=(4, 10))
     bar = ttk.Progressbar(frame, mode="determinate", maximum=100)
     bar.pack(fill=tk.X)
-    log_box = scrolledtext.ScrolledText(frame, height=12, state=tk.DISABLED)
+    log_box = scrolledtext.ScrolledText(
+        frame, height=12, state=tk.DISABLED, bg=LOG_BG, fg=TEXT,
+        insertbackground=TEXT, selectbackground=BORDER,
+        font="TkFixedFont", relief=tk.FLAT,
+        highlightthickness=1, highlightbackground=BORDER)
     log_box.pack(fill=tk.BOTH, expand=True, pady=10)
     buttons = ttk.Frame(frame)
     buttons.pack(fill=tk.X)
@@ -339,6 +544,11 @@ def run_gui(target):
         log_box.insert(tk.END, message + "\n")
         log_box.see(tk.END)
         log_box.configure(state=tk.DISABLED)
+
+    def _finish():
+        running["installing"] = False
+        cancel_button.configure(state=tk.DISABLED)
+        close_button.configure(state=tk.NORMAL)
 
     def _poll():
         try:
@@ -355,13 +565,20 @@ def run_gui(target):
                         _append(f"WARNING: {warning}")
                     _append("Installed. Find HicksField in the app menu.")
                     install_button.configure(state=tk.DISABLED)
-                    close_button.configure(state=tk.NORMAL)
+                    _finish()
+                    return
+                elif kind == "cancelled":
+                    status.configure(text="Install cancelled.")
+                    _append("Install cancelled. Press Install to try "
+                            "again.")
+                    install_button.configure(state=tk.NORMAL)
+                    _finish()
                     return
                 elif kind == "failed":
                     status.configure(text="Install failed.")
                     _append(f"FAILED: {payload}")
                     install_button.configure(state=tk.NORMAL)
-                    close_button.configure(state=tk.NORMAL)
+                    _finish()
                     messagebox.showerror("Install failed", payload)
                     return
         except queue.Empty:
@@ -369,17 +586,40 @@ def run_gui(target):
         root.after(100, _poll)
 
     def _start():
+        cancel_event.clear()
+        running["installing"] = True
         install_button.configure(state=tk.DISABLED)
+        cancel_button.configure(state=tk.NORMAL)
         close_button.configure(state=tk.DISABLED)
         status.configure(text="Installing.")
         threading.Thread(target=_worker, daemon=True).start()
         root.after(100, _poll)
 
+    def _cancel():
+        # The worker notices between steps and inside long commands,
+        # then reports back through the queue: the window never
+        # blocks waiting for it.
+        cancel_event.set()
+        cancel_button.configure(state=tk.DISABLED)
+        status.configure(text="Cancelling.")
+
+    def _close():
+        # Closing mid-install cancels instead of leaving a half
+        # installed tree behind.
+        if running["installing"]:
+            _cancel()
+            return
+        root.destroy()
+
     install_button = ttk.Button(buttons, text="Install",
-                                command=_start)
+                                style="Brass.TButton", command=_start)
     install_button.pack(side=tk.RIGHT, padx=(6, 0))
-    close_button = ttk.Button(buttons, text="Close", command=root.destroy)
+    cancel_button = ttk.Button(buttons, text="Cancel", command=_cancel)
+    cancel_button.pack(side=tk.RIGHT, padx=(6, 0))
+    cancel_button.configure(state=tk.DISABLED)
+    close_button = ttk.Button(buttons, text="Close", command=_close)
     close_button.pack(side=tk.RIGHT)
+    root.protocol("WM_DELETE_WINDOW", _close)
     root.mainloop()
     return 0
 

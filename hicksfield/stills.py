@@ -19,12 +19,10 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
-import time
 import urllib.request
 from pathlib import Path
 
-from hicksfield import machine, paths
+from hicksfield import machine, paths, sysdeps
 from hicksfield.downloader import download
 from hicksfield.errors import (
     CancelledError,
@@ -32,7 +30,7 @@ from hicksfield.errors import (
     EngineNotReadyError,
     HicksFieldError,
 )
-from hicksfield.steps import run_steps
+from hicksfield.steps import run_logged, run_steps, run_timed_out
 
 logger = logging.getLogger("hicksfield.stills")
 
@@ -193,45 +191,6 @@ def head_content_length(url, timeout=30):
         return None
 
 
-def _tail_lines(text, count=12):
-    lines = [line for line in text.splitlines() if line.strip()]
-    return lines[-count:]
-
-
-def run_logged(cmd, cwd=None, env=None, timeout_s=PER_IMAGE_TIMEOUT_S,
-               cancel_event=None):
-    """Run a long command with output to a temp file, not a pipe.
-
-    A pipe nobody reads fills up and deadlocks a long run. The temp file
-    keeps the last lines for the failure message. Returns (returncode,
-    tail_text). Raises CancelledError when the cancel event is set.
-    """
-    log = tempfile.TemporaryFile(mode="w+")
-    try:
-        try:
-            proc = subprocess.Popen(
-                cmd, cwd=cwd, env=env, stdout=log,
-                stderr=subprocess.STDOUT, text=True,
-            )
-        except OSError as exc:
-            return None, f"could not start the command: {exc}"
-        deadline = time.monotonic() + timeout_s
-        while proc.poll() is None:
-            if cancel_event is not None and cancel_event.is_set():
-                proc.kill()
-                proc.wait()
-                raise CancelledError()
-            if time.monotonic() > deadline:
-                proc.kill()
-                proc.wait()
-                return None, "the command ran past its time limit"
-            time.sleep(0.2)
-        log.seek(0)
-        return proc.returncode, "\n".join(_tail_lines(log.read()))
-    finally:
-        log.close()
-
-
 def _kill_after(proc, seconds=5):
     try:
         proc.terminate()
@@ -279,7 +238,11 @@ class StillEngine:
 
     def generate(self, prompt, out_path, seed=-1, cancel_event=None,
                  force=False):
-        """Make one picture. Returns the output Path."""
+        """Make one picture. Returns the output Path.
+
+        Callers pass an explicit seed, so the seed that made the
+        picture is known and the picture can be made again. A seed
+        of -1 lets the engine pick one (kept for direct callers)."""
         raise NotImplementedError
 
     def check_ram(self, force=False):
@@ -367,14 +330,36 @@ class FastSDCPUEngine(StillEngine):
         ]
         run_steps(steps, report=report, cancel_event=cancel_event)
 
-    def _setup_checkout(self, progress, _cancel):
+    def _setup_checkout(self, progress, cancel_event):
         if not self.cli_script.exists():
             self.base_dir.mkdir(parents=True, exist_ok=True)
             tarball = self.base_dir / "fastsdcpu.tar.gz"
-            download(FASTSD_CPU_TARBALL, tarball, progress_cb=None)
+            # The tarball is verified by size (its published length,
+            # from a HEAD request) and by unpacking: the download
+            # refuses a short file, and a damaged file fails to
+            # unpack. Progress and Cancel come from the downloader.
+            expected = head_content_length(FASTSD_CPU_TARBALL)
+
+            def _cb(done, total):
+                if total:
+                    progress(done / total * 0.5, "downloading")
+                else:
+                    progress(None, "downloading")
+
+            download(FASTSD_CPU_TARBALL, tarball,
+                     expected_size=expected, progress_cb=_cb,
+                     cancel_event=cancel_event)
             progress(0.5, "unpacking")
-            with tarfile.open(tarball, "r:gz") as archive:
-                archive.extractall(self.base_dir)
+            try:
+                with tarfile.open(tarball, "r:gz") as archive:
+                    archive.extractall(self.base_dir)
+            except (tarfile.TarError, OSError) as exc:
+                tarball.unlink(missing_ok=True)
+                raise DownloadError(
+                    "The stills engine download arrived damaged and "
+                    "could not be unpacked.",
+                    "Try setting up the engine again.",
+                ) from exc
             extracted = self.base_dir / f"fastsdcpu-{FASTSD_CPU_COMMIT}"
             if extracted.exists():
                 if self.checkout.exists():
@@ -416,16 +401,22 @@ class FastSDCPUEngine(StillEngine):
         Path(path).write_text(
             text.replace(anchor, patched, 1), encoding="utf-8")
 
-    def _setup_venv(self, progress, _cancel):
+    def _setup_venv(self, progress, cancel_event):
         if self.cli_python.exists():
             progress(1.0, "already there")
             return
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
+        code, tail = run_logged(
             [sys.executable, "-m", "venv", str(self.env_dir)],
-            capture_output=True, text=True, timeout=300,
+            timeout_s=300, cancel_event=cancel_event,
         )
-        if proc.returncode != 0 or not self.cli_python.exists():
+        if code != 0 or not self.cli_python.exists():
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "Making a home for the stills engine took too long "
+                    "and was stopped.",
+                    "Try setting up the engine again.",
+                )
             raise HicksFieldError(
                 "Could not make a home for the stills engine.",
                 "Run the HicksField installer again. It installs the "
@@ -447,6 +438,12 @@ class FastSDCPUEngine(StillEngine):
             timeout_s=1800, cancel_event=cancel_event,
         )
         if code != 0:
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "Installing the number-crunching pieces took too "
+                    "long and was stopped.",
+                    "Check the internet connection and try again.",
+                )
             raise HicksFieldError(
                 "Could not install the number-crunching pieces.",
                 "Check the internet connection and try again. "
@@ -470,6 +467,12 @@ class FastSDCPUEngine(StillEngine):
             pip + wanted, timeout_s=1800, cancel_event=cancel_event,
         )
         if code != 0:
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "Installing the engine pieces took too long and "
+                    "was stopped.",
+                    "Check the internet connection and try again.",
+                )
             raise HicksFieldError(
                 "Could not install the engine pieces.",
                 "Check the internet connection and try again. "
@@ -532,7 +535,7 @@ class FastSDCPUEngine(StillEngine):
     def _snapshot_results(self):
         if not self.results_dir.exists():
             return {}
-        return {p.name: p.stat().st_mtime_ns
+        return {p.name: (p.stat().st_mtime_ns, p.stat().st_size)
                 for p in self.results_dir.iterdir() if p.is_file()}
 
     def generate(self, prompt, out_path, seed=-1, cancel_event=None,
@@ -548,7 +551,6 @@ class FastSDCPUEngine(StillEngine):
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         before = self._snapshot_results()
-        started = time.time()
         env = dict(os.environ)
         threads = str(machine.worker_threads())
         env.update({
@@ -573,28 +575,28 @@ class FastSDCPUEngine(StillEngine):
             timeout_s=PER_IMAGE_TIMEOUT_S, cancel_event=cancel_event,
         )
         if code != 0:
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "The stills engine took too long and was stopped.",
+                    "Try again. If it keeps timing out, close other "
+                    "programs to free memory.",
+                )
             raise HicksFieldError(
                 "The stills engine stopped with an error.",
                 f"Last lines: {tail}" if tail else "Try again.",
             )
         after = self._snapshot_results()
-        new_names = [name for name, mtime in after.items()
-                     if name not in before or mtime > before[name]]
+        # Only a file this run produced counts: new, or changed since
+        # the snapshot (a different time or size). A previous run's
+        # picture is never picked up as this run's. When the engine
+        # produces nothing, the failure is reported plainly instead.
+        new_names = [name for name, stamp in after.items()
+                     if name not in before or stamp != before[name]]
         candidates = []
         for name in new_names:
             candidate = self.results_dir / name
             if candidate.suffix.lower() in (".png", ".jpg", ".jpeg"):
                 candidates.append(candidate)
-        if not candidates:
-            # Fall back to the newest image in the folder, made during
-            # this run.
-            for path in sorted(self.results_dir.iterdir(),
-                               key=lambda p: p.stat().st_mtime_ns,
-                               reverse=True):
-                if (path.suffix.lower() in (".png", ".jpg", ".jpeg")
-                        and path.stat().st_mtime >= started - 5):
-                    candidates.append(path)
-                    break
         if not candidates:
             raise HicksFieldError(
                 "The stills engine finished but no picture appeared.",
@@ -610,6 +612,43 @@ class FastSDCPUEngine(StillEngine):
         shutil.copyfile(newest, out_path)
         logger.info("Picture made with %s", self.label)
         return out_path
+
+
+def _ensure_tools(tools, packages, why, progress):
+    """Make sure the named command-line tools exist, installing their
+    packages first when any is missing.
+
+    The install asks for permission in a window, the way the ffmpeg
+    Install button does: the user is never sent to a terminal. This
+    runs on the setup worker thread, so the window stays responsive.
+    Raises HicksFieldError in plain words when a tool is still
+    missing afterwards.
+    """
+    missing = [tool for tool in tools if shutil.which(tool) is None]
+    if not missing:
+        return
+    names = sysdeps.describe_packages(packages)
+    progress(None, f"installing {names}")
+    error = sysdeps.install_packages(
+        packages, progress_cb=lambda m: progress(None, m))
+    still_missing = [tool for tool in missing
+                     if shutil.which(tool) is None]
+    if not still_missing:
+        return
+    if len(still_missing) == 1:
+        headline = f"{still_missing[0]} is not installed, and {why}."
+    else:
+        joined = (", ".join(still_missing[:-1]) + " and "
+                  + still_missing[-1])
+        headline = f"{joined} are not installed, and {why}."
+    if error is None:
+        detail = (f"{names} installed, but it is still not there. "
+                  "Run Set up again.")
+    else:
+        detail = (f"{names} could not be installed: {error}. Run Set "
+                  "up again and allow the permission step when it "
+                  "asks.")
+    raise HicksFieldError(headline, detail)
 
 
 class SDCppEngine(StillEngine):
@@ -706,23 +745,30 @@ class SDCppEngine(StillEngine):
         ]
         run_steps(steps, report=report, cancel_event=cancel_event)
 
-    def _setup_checkout(self, progress, _cancel):
+    def _setup_checkout(self, progress, cancel_event):
         if self.checkout.exists() and self.binary_path.exists():
             progress(1.0, "already there")
             return
         if shutil.which("git") is None:
-            raise HicksFieldError(
-                "git is not installed, and the image tool comes from git.",
-                "Install it with: sudo apt install git",
-            )
+            # Missing git is fixed in place: the setup installs it
+            # (one permission window), instead of sending the user
+            # to a terminal.
+            _ensure_tools(["git"], ["git"],
+                          "the image tool comes from git", progress)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         if not self.checkout.exists():
             code, tail = run_logged(
                 ["git", "clone", "--branch", SDCPP_RELEASE, "--depth", "1",
                  "--recurse-submodules", SDCPP_REPO, str(self.checkout)],
-                timeout_s=900,
+                timeout_s=900, cancel_event=cancel_event,
             )
             if code != 0 or not self.checkout.exists():
+                if run_timed_out(code, tail):
+                    raise DownloadError(
+                        "Getting the image tool took too long and was "
+                        "stopped.",
+                        "Check the internet connection and try again.",
+                    )
                 raise DownloadError(
                     "Could not get the image tool.",
                     "Check the internet connection and try again. "
@@ -734,12 +780,13 @@ class SDCppEngine(StillEngine):
         if self.binary_path.exists():
             progress(1.0, "already built")
             return
-        if shutil.which("cmake") is None:
-            raise HicksFieldError(
-                "cmake is not installed, and the image tool needs it "
-                "to build.",
-                "Install it with: sudo apt install cmake g++",
-            )
+        if shutil.which("cmake") is None or shutil.which("g++") is None:
+            # Missing build tools are fixed in place: the setup
+            # installs them (one permission window), instead of
+            # sending the user to a terminal.
+            _ensure_tools(["cmake", "g++"], ["cmake", "g++"],
+                          "the image tool needs them to build",
+                          progress)
         jobs = str(machine.worker_threads())
         progress(None, "setting up the build")
         code, tail = run_logged(
@@ -748,6 +795,13 @@ class SDCppEngine(StillEngine):
             cancel_event=cancel_event,
         )
         if code != 0:
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "Setting up the image tool build took too long "
+                    "and was stopped.",
+                    "Try again. A busy computer can be slow to set "
+                    "up the build.",
+                )
             raise HicksFieldError(
                 "The image tool build could not be set up.",
                 f"Last lines: {tail}" if tail else "Try again.",
@@ -759,6 +813,12 @@ class SDCppEngine(StillEngine):
             cancel_event=cancel_event,
         )
         if code != 0 or not self.binary_path.exists():
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "Building the image tool took too long and was "
+                    "stopped.",
+                    "Try again. The build is slow on a busy computer.",
+                )
             raise HicksFieldError(
                 "The image tool did not build.",
                 f"Last lines: {tail}" if tail else "Try again.",
@@ -827,6 +887,12 @@ class SDCppEngine(StillEngine):
             timeout_s=PER_IMAGE_TIMEOUT_S, cancel_event=cancel_event,
         )
         if code != 0:
+            if run_timed_out(code, tail):
+                raise HicksFieldError(
+                    "The stills engine took too long and was stopped.",
+                    "Try again. If it keeps timing out, close other "
+                    "programs to free memory.",
+                )
             raise HicksFieldError(
                 "The stills engine stopped with an error.",
                 f"Last lines: {tail}" if tail else "Try again.",

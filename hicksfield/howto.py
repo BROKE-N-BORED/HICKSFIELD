@@ -19,9 +19,12 @@ HOWTO_TOPICS = [
         "One or two sentences is enough. Example: a street musician plays "
         "violin under a train bridge at dusk, and a train rumbles past "
         "overhead.\n\n"
-        "Then press Break into scenes. If Ollama is running, a local model "
-        "turns the idea into scenes. If not, type the scenes yourself in "
-        "the Scenes window. Everything else works the same either way.",
+        "Then press Break into scenes. The Scenes window opens, and "
+        "if a model is picked, the breakdown starts straight away: "
+        "a local model turns the idea into scenes. If Ollama is not "
+        "running, or no model is picked yet, type the scenes "
+        "yourself in the Scenes window. Everything else works the "
+        "same either way.",
     ),
     (
         "Scenes",
@@ -85,6 +88,7 @@ HOWTO_TOPICS = [
     (
         "Keyboard shortcuts",
         "Ctrl+N starts a new film. Ctrl+O opens a film. Ctrl+S saves. "
+        "Ctrl+Z undoes the last scene change, in the Scenes window. "
         "F1 opens this How to Use window. Press ? anywhere to see the "
         "list again.\n\n"
         "Tab moves between buttons and boxes. Space presses the focused "
@@ -95,10 +99,11 @@ HOWTO_TOPICS = [
         "The lamp in the corner says what the app is doing: grey is idle, "
         "brass is working, green is done, red means something went wrong. "
         "The words next to it say what happened and what to do.\n\n"
-        "If ffmpeg is missing, run the HicksField installer again. It "
-        "installs ffmpeg for you.\n\n"
-        "The Debug report button in the Help menu copies a report about "
-        "what the app was doing. It holds no secrets.",
+        "If ffmpeg is missing, open the Export window and press "
+        "Install ffmpeg. It installs ffmpeg for you.\n\n"
+        "The Debug report item in the Help menu opens a window with "
+        "a report about what the app was doing. Press Copy the "
+        "report inside it to copy it. It holds no secrets.",
     ),
 ]
 

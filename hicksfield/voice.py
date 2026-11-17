@@ -21,7 +21,7 @@ from hicksfield.errors import (
     EngineNotReadyError,
     HicksFieldError,
 )
-from hicksfield.steps import run_steps
+from hicksfield.steps import run_logged, run_steps, run_timed_out
 
 logger = logging.getLogger("hicksfield.voice")
 
@@ -251,11 +251,19 @@ def _setup_piper(progress, cancel_event):
         progress(1.0, "already there")
         return
     progress(None, "installing")
-    proc = subprocess.run(
+    # run_logged, not subprocess.run: a pip install can take minutes,
+    # and Cancel must land while it runs (the child is killed).
+    code, tail = run_logged(
         [sys.executable, "-m", "pip", "install", "--quiet", PIPER_PACKAGE],
-        capture_output=True, text=True, timeout=900,
+        timeout_s=900, cancel_event=cancel_event,
     )
-    if proc.returncode != 0 or find_piper() is None:
+    if code != 0 or find_piper() is None:
+        if run_timed_out(code, tail):
+            raise HicksFieldError(
+                "Installing the voice program took too long and was "
+                "stopped.",
+                "Check the internet connection and try again.",
+            )
         raise HicksFieldError(
             "Could not install the voice program.",
             "Check the internet connection and try again.",
@@ -322,10 +330,38 @@ def wav_duration(path):
         return None
 
 
+# Silence for a scene with no spoken line: one second, at the rate
+# the voice itself uses.
+SILENCE_SECONDS = 1.0
+SILENCE_RATE = 22050
+
+
+def _write_silence(out_path, seconds=SILENCE_SECONDS):
+    """A silent WAV of `seconds`, for a scene with no spoken line.
+    Returns (path, duration_seconds)."""
+    frames = int(SILENCE_RATE * seconds)
+    with wave.open(str(out_path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(SILENCE_RATE)
+        handle.writeframes(b"\x00\x00" * frames)
+    return Path(out_path), seconds
+
+
 def synthesize(text, out_path, cancel_event=None,
                voice_id=VOICE_ID):
     """Speak `text` into a WAV file with the voice `voice_id`.
-    Returns (path, duration_seconds)."""
+    Returns (path, duration_seconds). A line with no words is
+    silence: a short silent file, with no voice needed, so a scene
+    left quiet on purpose can never break the job."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not text or not text.strip():
+        # HowTo promises a scene with no spoken line stays silent:
+        # the voice program is never started for an empty line (real
+        # piper exits 1 on empty input), and no setup is needed.
+        logger.info("Empty line: silence")
+        return _write_silence(out_path)
     ready, status = is_ready(voice_id)
     if not ready:
         raise EngineNotReadyError(
@@ -335,8 +371,6 @@ def synthesize(text, out_path, cancel_event=None,
     logger.info("Speaking a line")
     piper = find_piper()
     model = voice_dir(voice_id) / voice_files(voice_id)[0][0]
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.Popen(
             [str(piper), "--model", str(model),
@@ -362,10 +396,15 @@ def synthesize(text, out_path, cancel_event=None,
         out_path.unlink(missing_ok=True)
         raise CancelledError()
     if proc.returncode != 0:
+        # A traceback from the voice program is never shown to the
+        # user: it reads like a programmer's error, not a fix.
+        if err.strip() and "Traceback" not in err:
+            hint = f"Last words from the voice: {err.strip()[-300:]}"
+        else:
+            hint = "Try again."
         raise HicksFieldError(
             "The voice could not speak that line.",
-            f"Last words from the voice: {err.strip()[-300:]}"
-            if err.strip() else "Try again.",
+            hint,
         )
     duration = wav_duration(out_path)
     if duration is None or duration <= 0:

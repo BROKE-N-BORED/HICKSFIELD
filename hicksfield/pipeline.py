@@ -42,6 +42,9 @@ def build_film(project, project_dir, engine, report=None,
         )
     logger.info("Building film: %d scenes, engine %s",
                 len(project.scenes), engine.label)
+    # Fix each scene's asset identity before anything is made, so a
+    # scene that was reordered keeps its own filenames.
+    scenes_mod.ensure_asset_ids(project.scenes)
     asset_paths = scenes_mod.ensure_project_dirs(project_dir)
     result = {
         "engine": engine.label,
@@ -83,16 +86,30 @@ def build_film(project, project_dir, engine, report=None,
                 logger.info("Scene %d: kept its picture (already made)",
                             index + 1)
             else:
+                if not scene.prompt or not scene.prompt.strip():
+                    # A scene with no picture words cannot make a
+                    # picture (HowTo): the empty prompt is never
+                    # sent to the engine. Work made before this
+                    # scene is already saved and kept.
+                    raise HicksFieldError(
+                        f"Scene {index + 1} has no picture words yet.",
+                        "Type the picture words for that scene in "
+                        "the Scenes window, then build again.")
                 was_there = _asset_ready(project_dir, scene.still)
-                name = scenes_mod.scene_still_name(index)
+                name = scenes_mod.scene_still_name_for(scene, index)
                 out = asset_paths["stills"] / name
                 # A remake keeps the recorded seed: only the prompt
-                # changed, so the picture keeps its composition.
-                seed = scene.still_seed if scene.still_seed else -1
+                # changed, so the picture keeps its composition. A
+                # first make gets a fresh explicit seed, recorded
+                # below, so the picture can be made again.
+                seed = (scene.still_seed if scene.still_seed
+                        else scenes_mod.new_seed())
+                scenes_mod.archive_previous_asset(out)
                 engine.generate(scene.prompt, out, seed=seed,
                                 cancel_event=cancel, force=force_ram)
                 scene.still = f"{scenes_mod.STILLS_DIR}/{name}"
                 scene.still_prompt = scene.prompt
+                scene.still_seed = seed
                 remade.add(index)
                 result["stills_made"] += 1
                 if was_there:
@@ -125,7 +142,7 @@ def build_film(project, project_dir, engine, report=None,
             else:
                 was_there = _asset_ready(project_dir, scene.audio)
                 old_voice = scene.voice_id
-                name = scenes_mod.scene_audio_name(index)
+                name = scenes_mod.scene_audio_name_for(scene, index)
                 out = asset_paths["audio"] / name
                 _path, duration = voice.synthesize(
                     scene.narration, out, cancel_event=cancel,
@@ -174,7 +191,7 @@ def build_film(project, project_dir, engine, report=None,
                     logger.info(
                         "Scene %d: remade its moving clip "
                         "(%s)", index + 1, reason)
-                name = scenes_mod.scene_clip_name(index)
+                name = scenes_mod.scene_clip_name_for(scene, index)
                 out = asset_paths["clips"] / name
                 duration = state["durations"][index]
                 audio = (project_dir / scene.audio

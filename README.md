@@ -24,8 +24,9 @@ account, no subscription, no cloud.
 - A stills engine, set up from inside the app the first time you make
   pictures. The fast one uses 1-step distilled image models. The steady
   one builds a small C++ image tool from source. Both are free.
-- A voice, downloaded from inside the app the first time you add narration.
-  About 60 MB.
+- A voice, picked from three (Lessac, Ryan, or Alan) and downloaded from
+  inside the app the first time you add narration. About 60 MB for Lessac
+  or Alan, about 120 MB for Ryan.
 - Ollama, only if you want the idea broken into scenes for you. Without it,
   you type the scenes yourself and everything else works the same.
 
@@ -39,6 +40,11 @@ code, or clone the repo:
 Then double-click the installer. It installs HicksField, ffmpeg, and the
 Python venv package, adds HicksField to the app menu, and checks the
 install works before it reports success. No terminal needed.
+
+If double-clicking installer.py opens a text editor instead of the
+installer, the file is not marked as allowed to run. Right-click it,
+choose Allow Launching, then double-click it again. (The download
+from the Release page already has this set; a copy from git does not.)
 
 To install from a terminal instead: `bash install.sh`
 

@@ -51,11 +51,6 @@ def find_ffmpeg():
     return Path(found) if found else None
 
 
-def find_ffprobe():
-    found = shutil.which("ffprobe")
-    return Path(found) if found else None
-
-
 def ffmpeg_version():
     ffmpeg = find_ffmpeg()
     if ffmpeg is None:
@@ -352,25 +347,6 @@ def assemble(clips, film_path, srt_path=None, font_path=None,
         )
     logger.info("Film cut together")
     return film_path
-
-
-def probe_duration(path):
-    """Length of a media file in seconds, or None when unknown."""
-    ffprobe = find_ffprobe()
-    if ffprobe is None:
-        return None
-    try:
-        proc = subprocess.run(
-            [str(ffprobe), "-v", "error", "-show_entries",
-             "format=duration", "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    try:
-        return float(proc.stdout.strip())
-    except ValueError:
-        return None
 
 
 def extract_first_frame(film_path, out_path, timeout_s=60):

@@ -1,3 +1,4 @@
+import shutil
 import subprocess
 import threading
 import unittest
@@ -7,6 +8,27 @@ from hicksfield import pipeline, scenes as scenes_mod, video, voice
 from hicksfield.errors import CancelledError, HicksFieldError
 from hicksfield.stills import StillEngine
 from tests.helpers import TempEnvTestCase, write_png, write_wav
+
+
+def _probe_duration(path):
+    """Length of a media file in seconds, or None when ffprobe is
+    missing or cannot read it. Test-only helper: the app no longer
+    probes durations."""
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
 
 
 class FakeEngine(StillEngine):
@@ -83,7 +105,7 @@ class PipelineTests(TempEnvTestCase):
         self.assertTrue(captions.exists())
         self.assertIn("A stool sits here.",
                       captions.read_text(encoding="utf-8"))
-        duration = video.probe_duration(film)
+        duration = _probe_duration(film)
         if duration is not None:
             self.assertAlmostEqual(duration, 6.0, delta=0.5)
         # The project file records the assets.
