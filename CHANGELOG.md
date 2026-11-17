@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0 (2026-11-17)
+
+The update check: HicksField now checks for a new release when it
+starts, quietly, and asks before it ever downloads anything.
+
+- On launch, the app silently asks GitHub for the latest release.
+  When you already have the newest version, nothing happens: no
+  popup, no noise. When a newer release is out, it asks, and only
+  your tap starts the download.
+- The download is checked before anything is installed: the
+  release names the commit it was built from, and the download
+  must unpack into a folder carrying that commit. A download that
+  does not match is refused in plain words and nothing is
+  installed. Nothing is ever installed blind.
+- The install replaces the app files in place. The venv is never
+  touched, and your films, models, engines, and voices live
+  outside the app folder, so an update never wipes them. After
+  the install, the app asks whether to restart now or wait until
+  next time.
+- Help, Check for updates checks by hand and tells you the
+  result either way. Help, Check for updates on startup turns
+  the quiet startup check off and on.
+- The About box and the project file now read the version from
+  the same place, so they can no longer drift apart (the project
+  file still said 0.2.0 while the app said 0.4.0).
+
 ## 0.4.0 (2026-11-16)
 
 The full third task list (task list 3, items 1-48): the breakdown

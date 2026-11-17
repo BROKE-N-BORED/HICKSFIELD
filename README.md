@@ -51,6 +51,16 @@ To install from a terminal instead: `bash install.sh`
 To run from a terminal after installing:
 `bash ~/.local/share/hicksfield-app/run.sh`
 
+## Updates
+
+HicksField checks for a new release when it starts, quietly: when
+you already have the newest version, nothing happens. When a newer
+release is out, it asks. Only when you say yes does it download the
+update, check the download against the release, and install it,
+then ask whether to restart now or wait until next time. You can
+also check by hand from Help, Check for updates, or turn the
+startup check off from Help, Check for updates on startup.
+
 ## Tests
 
 From the source folder, with PySide6 installed:

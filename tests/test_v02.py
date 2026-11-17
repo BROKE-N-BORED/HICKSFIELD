@@ -917,9 +917,9 @@ class Item20Tests(GuiBase):
 
 
 class VersionTests(unittest.TestCase):
-    def test_version_is_0_3_0(self):
+    def test_version_is_0_5_0(self):
         from hicksfield import __version__
-        self.assertEqual(__version__, "0.4.0")
+        self.assertEqual(__version__, "0.5.0")
 
 
 if __name__ == "__main__":

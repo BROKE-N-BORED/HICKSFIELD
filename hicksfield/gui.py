@@ -83,6 +83,7 @@ from hicksfield import (
     scenes as scenes_mod,
     stills,
     sysdeps,
+    updates,
     video,
     voice,
 )
@@ -112,6 +113,10 @@ from hicksfield.workers import JobLock, Worker
 ORG_NAME = "BrokeNBored"
 APP_NAME = "HicksField"
 MAX_RECENT = 5
+
+# The exit code that means "restart me": run_app re-runs the app
+# when the event loop ends with this code (after an update).
+RESTART_EXIT_CODE = 42
 
 
 def _weak_slot(obj, method_name):
@@ -514,6 +519,54 @@ class TileButton(QPushButton):
         self.sub_label.setText(sub)
 
 
+class _UpdateProgressDialog(QDialog):
+    """The update's progress: what it is doing, how far along, and
+    a Cancel that works while the download runs. Once the check and
+    install start, Cancel greys out: those steps are quick and
+    cannot be half done."""
+
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Updating HicksField")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        title = QLabel("Updating HicksField")
+        title.setProperty("role", "title")
+        layout.addWidget(title)
+        self._label = QLabel("Downloading the update.")
+        self._label.setProperty("role", "muted")
+        self._label.setWordWrap(True)
+        layout.addWidget(self._label)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        layout.addWidget(self._bar)
+        self._cancel_button = QPushButton("Cancel")
+        self._cancel_button.clicked.connect(self._on_cancel)
+        layout.addWidget(self._cancel_button)
+        self.resize(420, 180)
+
+    def _on_progress(self, label, fraction, detail=""):
+        text = label
+        if detail:
+            text = "%s %s" % (label, detail)
+        self._label.setText(text)
+        try:
+            value = int(float(fraction) * 100)
+        except (TypeError, ValueError):
+            value = 0
+        self._bar.setValue(max(0, min(100, value)))
+        if label.startswith("Installing") or label.startswith("Checking"):
+            self._cancel_button.setEnabled(False)
+
+    def _on_cancel(self):
+        self._cancel_button.setEnabled(False)
+        self._label.setText("Stopping the update.")
+        self.cancelled.emit()
+
+
 class MainWindow(QMainWindow):
     DEFAULT_WIDTH = 1100
     DEFAULT_HEIGHT = 700
@@ -544,6 +597,13 @@ class MainWindow(QMainWindow):
         self._idea_project_dir = None
         self._ollama_ok = None
         self._ollama_worker = None
+        # The update check: one worker at a time, shared by the
+        # startup check, the manual check, and the download.
+        self._update_worker = None
+        self._update_check_started = False
+        self._update_check_manual = False
+        self._update_prompted_version = None
+        self._update_dialog = None
         self._checklist_dismissed = (
             settings().value("checklist/dismissed", 0, type=int) == 1)
         self._build_menus()
@@ -602,6 +662,19 @@ class MainWindow(QMainWindow):
         debug_action = QAction("Debug report", self)
         debug_action.triggered.connect(lambda: self.open_window("debug"))
         help_menu.addAction(debug_action)
+        check_updates_action = QAction("Check for updates", self)
+        check_updates_action.triggered.connect(self._on_check_updates)
+        help_menu.addAction(check_updates_action)
+        self._check_updates_action = check_updates_action
+        auto_update_action = QAction("Check for updates on startup",
+                                     self)
+        auto_update_action.setCheckable(True)
+        auto_update_action.setChecked(self._load_update_check())
+        auto_update_action.triggered.connect(
+            self._on_toggle_update_check)
+        help_menu.addAction(auto_update_action)
+        self._auto_update_action = auto_update_action
+        help_menu.addSeparator()
         about_action = QAction("About HicksField", self)
         about_action.triggered.connect(self._about)
         help_menu.addAction(about_action)
@@ -877,6 +950,239 @@ class MainWindow(QMainWindow):
         self._ollama_ok = False
         self._refresh_checklist()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # The quiet startup check: once, when the window first
+        # appears, and only when the user has not turned it off.
+        # It runs in a worker, so the window never waits on the
+        # network; when nothing is new, nothing is shown at all.
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        if self._load_update_check():
+            self._start_update_check(manual=False)
+
+    def _load_update_check(self):
+        """Whether the startup update check is on. Missing means
+        on: the app checks quietly on launch unless the user
+        turned it off (Help, Check for updates on startup)."""
+        return settings().value("check_updates_on_startup", 1,
+                                type=int) == 1
+
+    def _on_toggle_update_check(self, checked):
+        settings().setValue("check_updates_on_startup",
+                            1 if checked else 0)
+
+    def _start_update_check(self, manual):
+        """One update check in a worker, unless one is already
+        running. Returns False when a check is already running,
+        True when one started."""
+        if self._update_worker is not None:
+            return False
+        self._update_check_manual = manual
+        worker = Worker(
+            lambda report, cancel: updates.check_for_update(
+                __version__))
+        self._update_worker = worker
+        worker.done.connect(_weak_slot(self, "_on_update_check_done"))
+        worker.error.connect(_weak_slot(self, "_on_update_check_error"))
+        worker.start()
+        return True
+
+    def _on_check_updates(self):
+        """Help, Check for updates: a manual check, which works
+        whether or not the automatic one is on. The user asking
+        is not phoning home."""
+        if self._update_dialog is not None:
+            self.lamp.set_state("idle")
+            self.status_label.setText("An update is already running.")
+            return
+        if not self._start_update_check(manual=True):
+            self.lamp.set_state("idle")
+            self.status_label.setText("Already checking for updates.")
+            return
+        self.lamp.set_state("working")
+        self.status_label.setText("Checking for updates.")
+
+    def _on_update_check_error(self, _exc):
+        self._update_worker = None
+        manual = self._update_check_manual
+        self._update_check_manual = False
+        # A failed check is told only when the user asked. An
+        # automatic failure stays quiet: the check is a courtesy,
+        # not a demand.
+        if manual:
+            self.lamp.set_state("error")
+            self.status_label.setText("Could not check for updates.")
+
+    def _on_update_check_done(self, result):
+        self._update_worker = None
+        manual = self._update_check_manual
+        self._update_check_manual = False
+        state = result.get("state")
+        if state == "newer":
+            latest = result.get("latest")
+            if not manual and latest == self._update_prompted_version:
+                return
+            self._update_prompted_version = latest
+            self._show_update_available(result)
+            return
+        if state == "current":
+            if manual:
+                self.lamp.set_state("done")
+                self.status_label.setText(
+                    "You have the latest version (%s)." % __version__)
+            return
+        if manual:
+            self.lamp.set_state("error")
+            self.status_label.setText("Could not check for updates.")
+            self._show_update_problem(
+                "Could not check for updates",
+                result.get("reason") or "the check failed.")
+
+    def _show_update_problem(self, title, message, hint=""):
+        """A failed update step, told in full: the status line
+        only fits one line on the home window, and a failure the
+        user started deserves the whole reason."""
+        box = QMessageBox(self)
+        box.setWindowTitle(title)
+        box.setIcon(QMessageBox.Warning)
+        box.setText(message)
+        if hint:
+            box.setInformativeText(hint)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
+
+    def _show_update_available(self, result):
+        """A newer release is out: say so plainly, with the
+        version, and ask. Nothing downloads until the user taps
+        Update now."""
+        latest = result.get("latest")
+        box = QMessageBox(self)
+        box.setWindowTitle("A new version is out")
+        box.setText("HicksField %s is out. You have %s."
+                    % (latest, __version__))
+        body = (result.get("body") or "").strip()
+        if body:
+            box.setInformativeText(body[:500])
+        update_button = box.addButton(
+            "Update now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is update_button:
+            self._start_update_download(result)
+
+    def _start_update_download(self, release):
+        """Download, verify, and install the release, with real
+        progress and a cancel button. The install runs in the
+        worker; the restart question waits until it is done."""
+        dialog = _UpdateProgressDialog(self)
+        self._update_dialog = dialog
+
+        def _work(report, cancel):
+            return self._download_and_install(release, report, cancel)
+
+        worker = Worker(_work)
+        self._update_worker = worker
+        worker.progress.connect(_weak_slot(dialog, "_on_progress"))
+        worker.done.connect(_weak_slot(self, "_on_update_installed"))
+        worker.error.connect(_weak_slot(self, "_on_update_failed"))
+        dialog.cancelled.connect(worker.cancel)
+        worker.start()
+        dialog.exec()
+
+    def _download_and_install(self, release, report, cancel):
+        """The worker half: download the release, check it,
+        install it. Returns the new version string. Raises
+        HicksFieldError (plain words) or CancelledError."""
+        target = paths.data_dir() / "updates"
+        target.mkdir(parents=True, exist_ok=True)
+        tarball = target / ("hicksfield-%s.tar.gz"
+                            % release["latest"])
+
+        def _progress(downloaded, total):
+            if cancel.is_set():
+                return
+            if total:
+                fraction = min(downloaded / total, 1.0)
+                detail = "%s of %s." % (format_bytes(downloaded),
+                                        format_bytes(total))
+            else:
+                fraction = 0.0
+                detail = "%s so far." % format_bytes(downloaded)
+            report("Downloading the update.", fraction, detail)
+
+        updates.download_release(release, tarball,
+                                 progress_cb=_progress,
+                                 cancel_event=cancel)
+        if cancel.is_set():
+            raise CancelledError()
+        report("Checking the download.", 1.0, "")
+        version = updates.install_update(
+            tarball, release["sha"], release["latest"],
+            progress_cb=lambda label, fraction, detail="": report(
+                label, fraction, detail))
+        try:
+            tarball.unlink()
+        except OSError:
+            pass
+        return version
+
+    def _on_update_installed(self, version):
+        self._update_worker = None
+        dialog = self._update_dialog
+        self._update_dialog = None
+        if dialog is not None:
+            dialog.close()
+        # The new files are on disk; the running process still has
+        # the old version in memory. Restarting now runs the new
+        # one; saying no leaves the update for the next launch.
+        answer = QMessageBox.question(
+            self, "Update installed",
+            "HicksField %s is installed. Restart now to use it?"
+            % version,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if answer == QMessageBox.Yes:
+            self._restart_now()
+            return
+        self.lamp.set_state("done")
+        self.status_label.setText(
+            "HicksField %s is installed. It will be ready the next "
+            "time you start HicksField." % version)
+
+    def _on_update_failed(self, exc):
+        self._update_worker = None
+        dialog = self._update_dialog
+        self._update_dialog = None
+        if dialog is not None:
+            dialog.close()
+        if isinstance(exc, CancelledError):
+            self.lamp.set_state("idle")
+            self.status_label.setText(
+                "Update stopped. Nothing was installed.")
+            return
+        if isinstance(exc, HicksFieldError):
+            message = exc.message
+            hint = exc.hint or ""
+        else:
+            message = str(exc)
+            hint = ""
+            logging.getLogger("hicksfield.gui").exception(
+                "unexpected update error: %s", exc)
+        self._show_update_problem("Update failed", message, hint)
+        self.lamp.set_state("error")
+        self.status_label.setText(message)
+
+    def _restart_now(self):
+        """Restart the app so the new version runs. Closing first
+        asks about a running job and saves the windows; if the
+        close is refused, the restart waits and the update applies
+        on the next launch instead."""
+        if not self.close():
+            return False
+        QApplication.exit(RESTART_EXIT_CODE)
+        return True
+
     def _break_from_home(self):
         """The home button does what it says: open the Scenes window
         and start the breakdown when an idea is typed and a model is
@@ -1092,9 +1398,9 @@ class MainWindow(QMainWindow):
     def _about(self):
         QMessageBox.about(
             self, "About HicksField",
-            "HicksField 0.4.0\n\nA free local film studio by "
+            "HicksField %s\n\nA free local film studio by "
             "Broke n' Bored Studio.\n\nYour idea in, a short film out. "
-            "Everything runs on this computer.")
+            "Everything runs on this computer." % __version__)
 
     def closeEvent(self, event):
         settings().setValue("geometry/main", self.saveGeometry())
@@ -1107,6 +1413,8 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.Yes:
                 event.ignore()
                 return
+        if self._update_worker is not None:
+            self._update_worker.cancel()
         for window in list(self._windows.values()):
             window.close()
         super().closeEvent(event)
@@ -3920,6 +4228,8 @@ def run_app(argv):
     set_motion_enabled(
         settings().value("motion/enabled", 1, type=int) == 1)
     debuglog.setup_debug_log(paths.log_dir())
+    logging.getLogger("hicksfield").info("HicksField %s started.",
+                                         __version__)
     paths.ensure_dirs()
 
     state = AppState()
@@ -3936,6 +4246,16 @@ def run_app(argv):
     main.show()
     code = app.exec()
     single.release()
+    if code == RESTART_EXIT_CODE:
+        # An update asked for a restart: the windows are closed and
+        # the single-instance lock is given up, so the fresh app
+        # starts clean with the new version on disk.
+        try:
+            updates.restart_app()
+        except OSError as exc:
+            logging.getLogger("hicksfield").error(
+                "Restart after update failed: %s", exc)
+            return 1
     return code
 
 

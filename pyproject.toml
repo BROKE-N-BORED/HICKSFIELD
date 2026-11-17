@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hicksfield"
-version = "0.2.0"
+version = "0.5.0"
 description = "HicksField: a free local film studio for Linux. Type an idea, get a short film."
 readme = "README.md"
 requires-python = ">=3.10"

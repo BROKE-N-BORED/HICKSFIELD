@@ -445,7 +445,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_installs_missing_qt_lib_and_retries(self):
         runs = [
-            (0, "HicksField 0.4.0\n", ""),
+            (0, "HicksField 0.5.0\n", ""),
             (1, "", "error while loading shared libraries: "
              "libEGL.so.1: cannot open shared object file"),
             (0, "qt ok\n", ""),
@@ -459,7 +459,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_unknown_lib_warns_plainly(self):
         runs = [
-            (0, "HicksField 0.4.0\n", ""),
+            (0, "HicksField 0.5.0\n", ""),
             (1, "", "libSomething.so.3: cannot open shared object"),
         ]
         _messages, warnings, install = self._verify(runs)
@@ -471,7 +471,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_declined_qt_install_warns(self):
         runs = [
-            (0, "HicksField 0.4.0\n", ""),
+            (0, "HicksField 0.5.0\n", ""),
             (1, "", "libEGL.so.1: cannot open shared object file"),
         ]
         _messages, warnings, install = self._verify(
