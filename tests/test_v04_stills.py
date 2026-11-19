@@ -616,6 +616,12 @@ class ThumbnailCacheTests(GuiBase):
         self.state.project.scenes = scenes
         self.state.save()
         window = self._show(StillsWindow)
+        # List 5 item 23: thumbnails decode off the GUI thread and
+        # land in the cache as they finish. Wait for both before
+        # asserting on the cache.
+        from tests.helpers import wait_for
+        self.assertTrue(wait_for(
+            lambda: len(window._thumb_cache) == 2, timeout_ms=10000))
         return window
 
     def test_refresh_reuses_cached_thumbnails(self):
@@ -629,6 +635,7 @@ class ThumbnailCacheTests(GuiBase):
             self.assertIs(window._thumb_cache[key], icon)
 
     def test_a_changed_picture_gets_a_fresh_thumbnail(self):
+        from tests.helpers import wait_for
         window = self._two_scenes_with_pictures()
         window._refresh()
         first_icons = dict(window._thumb_cache)
@@ -637,6 +644,10 @@ class ThumbnailCacheTests(GuiBase):
             handle.write(b"CHANGED")
         os.utime(path, (time.time() + 2, time.time() + 2))
         window._refresh()
+        # The changed picture's new thumbnail decodes off-thread;
+        # wait for it to land.
+        self.assertTrue(wait_for(
+            lambda: len(window._thumb_cache) == 2, timeout_ms=10000))
         changed = [icon for key, icon in window._thumb_cache.items()
                    if "scene-01.png" in key[0]]
         self.assertEqual(len(changed), 1)

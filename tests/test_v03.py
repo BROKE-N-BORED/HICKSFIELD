@@ -942,7 +942,12 @@ class VoicePickerGuiTests(AssetGuiBase):
         window = self._show(VoiceWindow)
         self.assertFalse(window.make_button.isEnabled())
         index = window.voice_combo.findData("en_US-ryan-high")
-        window.voice_combo.setCurrentIndex(index)
+        # List 5 item 1: the switch asks first now, on every path.
+        # Answer Yes, as the user confirming the switch would.
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.Yes):
+            window.voice_combo.setCurrentIndex(index)
         self.assertEqual(self.state.project.voice,
                          "en_US-ryan-high")
         widget = window.line_list.itemWidget(

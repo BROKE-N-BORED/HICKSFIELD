@@ -12,7 +12,7 @@ class MainTests(unittest.TestCase):
             [sys.executable, "-m", "hicksfield", "--version"],
             cwd=str(TREE), capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("HicksField 0.5.0", proc.stdout)
+        self.assertIn("HicksField 0.6.0", proc.stdout)
 
     def test_help(self):
         proc = subprocess.run(

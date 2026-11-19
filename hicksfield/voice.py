@@ -229,8 +229,13 @@ def is_ready(voice_id=VOICE_ID):
         return False, "Not set up yet: the voice program is missing."
     have, total = voice_status(voice_id)
     if have < total:
+        if have == 0:
+            return False, (
+                "Not set up yet: the voice files are not "
+                "downloaded yet."
+            )
         return False, (
-            f"Set up halfway: the voice is {have} of {total} files "
+            f"Set up partway: the voice is {have} of {total} files "
             "downloaded."
         )
     return True, "Ready."

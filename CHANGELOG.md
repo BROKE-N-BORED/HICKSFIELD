@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.6.0 (2026-11-19)
+
+The full fifth task list (task list 5, items 1-26): the voice
+warning that never fired, breakdowns landing in the wrong film,
+the Export player that stayed silent after a build, windows that
+outgrew the screen, and a pass of state, wording, and speed fixes.
+
+- Changing the voice now asks first on every way of changing it:
+  picking from the list, the arrow keys, and the mouse wheel all
+  ask before any spoken line is left behind, and No puts the
+  picker back. After a switch, the status says how many lines the
+  new voice has to speak again, instead of leaving the old count
+  standing.
+- A scene breakdown is bound to the film it started in. Switching
+  films while one runs no longer writes the new scenes into the
+  wrong film: they are saved to the film they belong to, and the
+  status says so.
+- The Export player loads the film fresh after a build, so Play
+  works without closing and reopening the window.
+- A scene with no spoken line now reads as silent in the Voice
+  window, the spoken-line count only counts lines with words,
+  and the Voice window says what to do when there are no lines
+  yet.
+- The Export and Scenes windows fit a 768-tall screen: no window
+  can grow past the screen any more, the player area is shorter,
+  the scene list scrolls, and the status line stays in sight
+  during a breakdown.
+- Every stage window now ends with the way on: Next: make the
+  pictures in Scenes, Next: make the spoken lines in Stills,
+  Next: build the film in Voice, and Back to Home in Export.
+- Export no longer asks the fast-or-steady question a second
+  time. The engine picked in Stills is remembered, and Export
+  has one Build the film button for it; building with the other
+  engine makes that one the choice.
+- Export only loads its media player once a film exists. Before
+  that it says no film yet and what happens here, instead of
+  showing a player that can do nothing.
+- The model list in Scenes fills from the names straight away,
+  so the window is usable while the model details catch up.
+- Stills thumbnails decode off the main thread: opening Stills
+  no longer pauses while a film's pictures are read.
+- Stopping a set up halfway no longer shows a red error: the
+  lamp stays calm and the words say set up can run again.
+- When a check for updates is already running, the note it
+  leaves now clears itself when that check finishes.
+- An installer failure now names the real trouble (a full disk,
+  a permissions problem, a network problem) instead of always
+  blaming the internet connection.
+- Smaller fixes: the installer's log no longer breaks the
+  install path mid-word; a voice with nothing downloaded says
+  "Not set up yet" instead of "Set up halfway"; the Home tiles
+  say Click, not Tap, on a desktop; the Scenes Save button is
+  greyed out until a scene is chosen; the edit boxes clear while
+  a breakdown is on the way instead of showing the words of a
+  scene about to be replaced; Export with no scenes says there
+  is nothing to build instead of promising one; the Stills seed
+  box is wide enough for the seed; and the memory warnings no
+  longer print two full stops.
+
 ## 0.5.0 (2026-11-17)
 
 The update check: HicksField now checks for a new release when it

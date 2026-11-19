@@ -226,6 +226,39 @@ def make_venv(target, log, cancel_event=None):
     return python
 
 
+def _pip_failure_hint(err):
+    """The plain-words hint for a failed toolkit install, naming
+    the failure family the log actually shows: a full disk is not
+    an internet problem, and the headline must not send the user
+    to check the wrong thing."""
+    tail = err.strip().splitlines()[-1:] if err.strip() else []
+    text = err or ""
+    lowered = text.lower()
+    if "no space left" in lowered or "errno 28" in lowered:
+        family = ("The disk is full. Free some space, then run "
+                  "the installer again.")
+    elif "do not match the hashes" in lowered or "hash" in lowered \
+            and "mismatch" in lowered:
+        family = ("The download did not match what was expected, "
+                  "so nothing was installed. Run the installer "
+                  "again.")
+    elif "permission denied" in lowered or "errno 13" in lowered:
+        family = ("The installer was not allowed to write where "
+                  "it needs to. Run the installer again and allow "
+                  "the permission step when it asks.")
+    elif any(word in lowered for word in (
+            "connection", "name or service not known",
+            "name resolution", "timed out", "timeout",
+            "network is unreachable", "ssl", "certificate",
+            "remote end closed", "download")):
+        family = ("Check the internet connection and try again.")
+    else:
+        family = "Run the installer again and try again."
+    if tail:
+        return f"{family} Last lines: {tail}"
+    return family
+
+
 def install_deps(venv_python, log, cancel_event=None):
     log("Installing the window toolkit (PySide6). This takes a bit.")
     code, _out, err = run(
@@ -236,8 +269,7 @@ def install_deps(venv_python, log, cancel_event=None):
     if code != 0:
         raise InstallError(
             "Could not install the window toolkit.",
-            "Check the internet connection and try again. "
-            f"Last lines: {err.strip().splitlines()[-1:]}",
+            _pip_failure_hint(err),
         )
     log("Window toolkit installed.")
 
@@ -531,7 +563,7 @@ def run_gui(target):
     log_box = scrolledtext.ScrolledText(
         frame, height=12, state=tk.DISABLED, bg=LOG_BG, fg=TEXT,
         insertbackground=TEXT, selectbackground=BORDER,
-        font="TkFixedFont", relief=tk.FLAT,
+        font="TkFixedFont", relief=tk.FLAT, wrap=tk.WORD,
         highlightthickness=1, highlightbackground=BORDER)
     log_box.pack(fill=tk.BOTH, expand=True, pady=10)
     buttons = ttk.Frame(frame)

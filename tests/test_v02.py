@@ -202,11 +202,15 @@ class Item3Tests(GuiBase):
         self.assertEqual(window._default_size, (900, 700))
 
     def test_scenes_list_fits_three_film_frames(self):
-        # Three 64 px rows need 194 px; without a minimum the
-        # layout squeezes the list down to a single row.
+        # List 5 item 12 supersedes the three-row minimum: the
+        # window has to fit a 768-tall screen with a panel, so the
+        # list now guarantees two whole 64 px rows (130 px) and
+        # scrolls for the rest. Without a minimum the layout
+        # squeezes the list down to a single row.
         window = self._show(ScenesWindow)
         self.assertGreaterEqual(window.scene_list.minimumHeight(),
-                                194)
+                                130)
+        self.assertLess(window.minimumSizeHint().height(), 728)
 
 
 class Item4Tests(GuiBase):
@@ -815,14 +819,47 @@ class Item17Tests(GuiBase):
             self.assertTrue(window.steady_card.badge.isVisible())
 
     def test_export_marks_the_recommended_button(self):
+        # List 5 item 20: Export no longer asks the engine
+        # question twice. With no remembered choice, the
+        # recommended engine's button is the one primary
+        # "Build the film"; the other stays a named choice.
         self.state.project.scenes = [
             scenes_mod.Scene(prompt="a", narration="b")]
         self.state.project_changed.emit()
         window = self._show(ExportWindow)
         self.assertIn("No picture engine is set up yet",
                       window.engine_note.text())
-        self.assertIn("(recommended)", window.fast_build.text())
-        self.assertNotIn("(recommended)", window.steady_build.text())
+        self.assertEqual(window.fast_build.text(), "Build the film")
+        self.assertEqual(window.fast_build.property("role"),
+                         "primary")
+        self.assertEqual(window.steady_build.text(),
+                         "Build with the steady engine")
+
+    def test_export_build_button_follows_the_stills_choice(self):
+        # A choice remembered from Stills moves the primary
+        # button, and the note says so. Steady is the only engine
+        # ready here, so it is also the recommended one: picking
+        # fast in Stills is a real choice away from the
+        # recommendation, which is what the note reports.
+        from hicksfield.gui import settings
+
+        settings().setValue("build/engine", "fastsd")
+        try:
+            self.state.project.scenes = [
+                scenes_mod.Scene(prompt="a", narration="b")]
+            self.state.project_changed.emit()
+            with mock.patch.object(
+                    stills.SDCppEngine, "is_ready",
+                    return_value=(True, "Ready.")):
+                window = self._show(ExportWindow)
+                self.assertEqual(window.fast_build.text(),
+                                 "Build the film")
+                self.assertEqual(window.steady_build.text(),
+                                 "Build with the steady engine")
+                self.assertIn("You picked the fast engine",
+                              window.engine_note.text())
+        finally:
+            settings().remove("build/engine")
 
 
 class Item18Tests(GuiBase):
@@ -919,7 +956,7 @@ class Item20Tests(GuiBase):
 class VersionTests(unittest.TestCase):
     def test_version_is_0_5_0(self):
         from hicksfield import __version__
-        self.assertEqual(__version__, "0.5.0")
+        self.assertEqual(__version__, "0.6.0")
 
 
 if __name__ == "__main__":

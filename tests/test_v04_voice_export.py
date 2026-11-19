@@ -404,18 +404,22 @@ class VoiceSwitchWarningTests(GuiBase):
         combo.hidePopup()
 
     def test_programmatic_switch_asks_nothing(self):
-        # A change made by code, with the picker closed, is not a
-        # person about to lose work: no dialog, and the switch lands.
+        # A change made by the app's own code is not a person
+        # about to lose work: no dialog, and the picker follows.
+        # The app's code path is the refresh, which sets the
+        # picker with signals blocked. (A bare setCurrentIndex is
+        # what a user's pick looks like by the time the signal
+        # lands, so that path asks now: list 5 item 1.)
         self._two_scenes()
         window = self._show(VoiceWindow)
-        combo = window.voice_combo
-        ryan = combo.findData("en_US-ryan-high")
+        self.state.project.voice = "en_US-ryan-high"
         with mock.patch.object(
                 QMessageBox, "question",
                 return_value=QMessageBox.No) as asked:
-            combo.setCurrentIndex(ryan)
+            window._refresh()
         asked.assert_not_called()
-        self.assertEqual(self.state.project.voice, "en_US-ryan-high")
+        self.assertEqual(window.voice_combo.currentData(),
+                         "en_US-ryan-high")
 
     def test_keyboard_switch_warns_and_no_keeps_the_voice(self):
         self._two_scenes()
@@ -447,7 +451,12 @@ class LegacyVoiceGuiTests(GuiBase):
         self.assertIn("[spoken]", self._row_label(window, 0))
         self.assertFalse(window.make_button.isEnabled())
         ryan = window.voice_combo.findData("en_US-ryan-high")
-        window.voice_combo.setCurrentIndex(ryan)
+        # List 5 item 1: the switch asks first now, on every path.
+        # Answer Yes, as the user confirming the switch would.
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.Yes):
+            window.voice_combo.setCurrentIndex(ryan)
         self.assertIn("[out of date]", self._row_label(window, 0))
         self.assertTrue(window.make_button.isEnabled())
 
@@ -499,7 +508,10 @@ class VoiceMakeSilentTests(GuiBase):
             self.assertTrue(scene.audio)
             self.assertTrue(
                 (self.state.project_dir / scene.audio).exists())
-        self.assertIn("Spoke 2 lines", window.status_label.text())
+        # List 5 item 5: silent scenes are not spoken lines, and
+        # the status says so instead of counting them.
+        self.assertIn("no lines were spoken",
+                      window.status_label.text())
 
 
 class ExportNoEngineTests(GuiBase):
@@ -624,8 +636,13 @@ class ExportPosterTests(GuiBase):
     def test_no_film_shows_no_poster_note(self):
         window = self._show(ExportWindow)
         self.assertFalse(window._poster_failed)
-        self.assertIs(window._player_stack.currentWidget(),
-                      window.video_widget)
+        # List 5 items 22 and 24: with no film there is no player
+        # at all. The player box hides, the no-film note stands in
+        # its place, and the poster-failure note stays out of it.
+        self.assertTrue(window.player_box.isHidden())
+        self.assertFalse(window.no_film_note.isHidden())
+        self.assertIsNot(window._player_stack.currentWidget(),
+                         window.poster_note)
 
 
 class ExportSilentFilmTests(GuiBase):

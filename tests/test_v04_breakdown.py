@@ -380,9 +380,16 @@ class ModelCheckParallelTests(unittest.TestCase):
         self.assertEqual(len(result), 3)
         self.assertTrue(all(info["capabilities"] == ["chat"]
                             for info in result))
-        self.assertEqual(len(reports), 3)
-        self.assertEqual(reports[0][0], "models")
-        self.assertIn("3 of 3", reports[-1][2])
+        # List 5 item 21: the names are reported first, as soon
+        # as they are known, so the picker can fill and be used
+        # while the details catch up; each model's details follow,
+        # and the per-model progress still ends at 3 of 3.
+        labels = [report[0] for report in reports]
+        self.assertEqual(labels[0], "names")
+        self.assertEqual(labels.count("model"), 3)
+        self.assertEqual(labels.count("models"), 3)
+        models_reports = [r for r in reports if r[0] == "models"]
+        self.assertIn("3 of 3", models_reports[-1][2])
 
     def test_empty_model_list_reports_nothing(self):
         reports = []
