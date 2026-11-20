@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import installer  # noqa: E402
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QLabel  # noqa: E402
+from PySide6.QtWidgets import QLabel, QMessageBox  # noqa: E402
 
 from hicksfield import scenes as scenes_mod  # noqa: E402
 from hicksfield import stills  # noqa: E402
@@ -445,7 +445,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_installs_missing_qt_lib_and_retries(self):
         runs = [
-            (0, "HicksField 0.6.0\n", ""),
+            (0, "HicksField 0.7.0\n", ""),
             (1, "", "error while loading shared libraries: "
              "libEGL.so.1: cannot open shared object file"),
             (0, "qt ok\n", ""),
@@ -459,7 +459,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_unknown_lib_warns_plainly(self):
         runs = [
-            (0, "HicksField 0.6.0\n", ""),
+            (0, "HicksField 0.7.0\n", ""),
             (1, "", "libSomething.so.3: cannot open shared object"),
         ]
         _messages, warnings, install = self._verify(runs)
@@ -471,7 +471,7 @@ class InstallerLibTests(unittest.TestCase):
 
     def test_verify_declined_qt_install_warns(self):
         runs = [
-            (0, "HicksField 0.6.0\n", ""),
+            (0, "HicksField 0.7.0\n", ""),
             (1, "", "libEGL.so.1: cannot open shared object file"),
         ]
         _messages, warnings, install = self._verify(
@@ -710,6 +710,130 @@ class RunShTests(unittest.TestCase):
         proc = self._run()
         self.assertEqual(proc.returncode, 3)
         self.assertEqual(self._dialog_log(), "")
+
+
+class List6RenameDeleteTests(HomeBase):
+    """List 6 item 6: films can be renamed and deleted from the
+    File menu. Rename moves the folder and follows in Recent
+    films; a folder collision is refused plainly; delete asks,
+    defaults to No, and leaves a clean no-film state."""
+
+    def test_file_menu_has_rename_and_delete(self):
+        main = self._show(MainWindow)
+        texts = []
+        for action in main.menuBar().actions():
+            if action.text() == "File":
+                texts = [sub.text()
+                         for sub in action.menu().actions()]
+        self.assertIn("Rename film...", texts)
+        self.assertIn("Delete film...", texts)
+        # Next to Open film.
+        self.assertEqual(texts.index("Rename film..."),
+                         texts.index("Open film") + 1)
+        self.assertEqual(texts.index("Delete film..."),
+                         texts.index("Open film") + 2)
+
+    def test_rename_moves_folder_and_recents_follow(self):
+        from PySide6.QtWidgets import QInputDialog
+        main = self._show(MainWindow)
+        old_dir = self.state.project_dir
+        main._remember_recent(old_dir)
+        with mock.patch.object(
+                QInputDialog, "getText",
+                return_value=("harbour lights", True)):
+            main._rename_project()
+        new_dir = old_dir.parent / "harbour-lights"
+        self.assertFalse(old_dir.exists())
+        self.assertTrue((new_dir / "project.json").exists())
+        self.assertEqual(self.state.project_dir, new_dir)
+        self.assertEqual(self.state.project.name, "harbour lights")
+        on_disk = scenes_mod.load_project(new_dir)
+        self.assertEqual(on_disk.name, "harbour lights")
+        recent = _load_recent()
+        self.assertIn(str(new_dir), recent)
+        self.assertNotIn(str(old_dir), recent)
+        self.assertIn("Renamed the film to harbour lights",
+                      main.status_label.text())
+
+    def test_rename_to_an_existing_folder_is_refused(self):
+        from PySide6.QtWidgets import QInputDialog
+        main = self._show(MainWindow)
+        other = self.state.new_project("other film")
+        # Open the first film again: it is the one being renamed.
+        first = other.parent / "test-film"
+        self.state.open_project(first)
+        with mock.patch.object(
+                QInputDialog, "getText",
+                return_value=("other film", True)):
+            main._rename_project()
+        self.assertEqual(self.state.project_dir, first)
+        self.assertEqual(self.state.project.name, "test film")
+        self.assertTrue((other / "project.json").exists())
+        self.assertIn("already a folder named other-film",
+                      main.status_label.text())
+
+    def test_rename_waits_for_a_running_job(self):
+        from PySide6.QtWidgets import QInputDialog
+        main = self._show(MainWindow)
+        self.assertTrue(self.state.try_job("Breaking the idea "
+                                           "into scenes"))
+        try:
+            with mock.patch.object(
+                    QInputDialog, "getText",
+                    return_value=("new name", True)) as asked:
+                main._rename_project()
+            asked.assert_not_called()
+            self.assertIn("Already busy", main.status_label.text())
+        finally:
+            self.state.finish_job()
+
+    def test_delete_asks_and_defaults_to_no(self):
+        main = self._show(MainWindow)
+        target = self.state.project_dir
+        seen = {}
+
+        def _question(*args, **kwargs):
+            seen["default"] = args[4] if len(args) > 4 else None
+            return QMessageBox.No
+
+        with mock.patch.object(QMessageBox, "question", _question):
+            main._delete_project()
+        self.assertTrue(target.exists())
+        self.assertEqual(self.state.project_dir, target)
+        self.assertEqual(seen["default"], QMessageBox.No)
+
+    def test_delete_removes_folder_recents_and_leaves_no_film(self):
+        main = self._show(MainWindow)
+        target = self.state.project_dir
+        main._remember_recent(target)
+        with mock.patch.object(
+                QMessageBox, "question",
+                return_value=QMessageBox.Yes):
+            main._delete_project()
+        self.assertFalse(target.exists())
+        self.assertIsNone(self.state.project_dir)
+        self.assertEqual(self.state.project.scenes, [])
+        self.assertNotIn(str(target), _load_recent())
+        self.assertIn("Deleted test film.",
+                      main.status_label.text())
+        # No film open: the actions grey out.
+        self.assertFalse(main._rename_action.isEnabled())
+        self.assertFalse(main._delete_action.isEnabled())
+
+    def test_delete_waits_for_a_running_job(self):
+        main = self._show(MainWindow)
+        target = self.state.project_dir
+        self.assertTrue(self.state.try_job("Making the pictures"))
+        try:
+            with mock.patch.object(
+                    QMessageBox, "question",
+                    return_value=QMessageBox.Yes) as asked:
+                main._delete_project()
+            asked.assert_not_called()
+            self.assertTrue(target.exists())
+            self.assertIn("Already busy", main.status_label.text())
+        finally:
+            self.state.finish_job()
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import json
 import logging
 import random
 import re
+import shutil
 import sys
 import time
 import weakref
@@ -232,6 +233,43 @@ class AppState(QObject):
         scenes_mod.ensure_project_dirs(project_dir)
         self.project_changed.emit()
         return project_dir
+
+    def rename_project(self, new_name):
+        """Rename the open film: the name it is stored under and
+        its folder, which takes the new name's slug beside the old
+        one. A different folder already holding that slug is a
+        plain refusal: renaming never overwrites another film.
+        Returns the film's folder, new or (when only the name's
+        words changed) unchanged."""
+        old_dir = self.project_dir
+        slug = slugify(new_name)
+        target = old_dir.parent / slug
+        if target != old_dir and target.exists():
+            raise HicksFieldError(
+                f"There is already a folder named {slug}.",
+                "The film keeps its old name. Pick a different "
+                "name, or delete that film first.",
+            )
+        self.project.name = new_name
+        if target != old_dir:
+            old_dir.rename(target)
+            self.project_dir = target
+        self.save()
+        return self.project_dir
+
+    def delete_project(self):
+        """Remove the open film's folder from disk and leave no
+        film open. The caller confirms with the user first and
+        makes sure no job is running: a job writing into the
+        folder while it goes would corrupt both."""
+        target = self.project_dir
+        if target is None:
+            return None
+        shutil.rmtree(target)
+        self.project = scenes_mod.Project(idea="", scenes=[])
+        self.project_dir = None
+        self.project_changed.emit()
+        return target
 
     def save(self, _project=None):
         """Save the current project. The optional argument exists so
@@ -658,6 +696,14 @@ class MainWindow(QMainWindow):
         open_action.setShortcutContext(Qt.ApplicationShortcut)
         open_action.triggered.connect(self._open_project)
         file_menu.addAction(open_action)
+        rename_action = QAction("Rename film...", self)
+        rename_action.triggered.connect(self._rename_project)
+        file_menu.addAction(rename_action)
+        self._rename_action = rename_action
+        delete_action = QAction("Delete film...", self)
+        delete_action.triggered.connect(self._delete_project)
+        file_menu.addAction(delete_action)
+        self._delete_action = delete_action
         save_action = QAction("Save", self)
         save_action.setShortcut(QKeySequence("Ctrl+S"))
         save_action.setShortcutContext(Qt.ApplicationShortcut)
@@ -1276,6 +1322,11 @@ class MainWindow(QMainWindow):
     def _refresh(self):
         self.project_label.setText(
             f"Film: {self.state.project_name()}")
+        # Rename and Delete act on the open film: with no film
+        # open there is nothing to act on, so they grey out.
+        has_film = self.state.project_dir is not None
+        self._rename_action.setEnabled(has_film)
+        self._delete_action.setEnabled(has_film)
         dates_text = film_dates_text(self.state.project)
         self.project_dates_label.setText(dates_text)
         self.project_dates_label.setVisible(bool(dates_text))
@@ -1430,6 +1481,63 @@ class MainWindow(QMainWindow):
         self.lamp.set_state("done")
         self.status_label.setText(f"Opened {target.name}.")
 
+    def _rename_project(self):
+        if self.state.project_dir is None:
+            return
+        if self.state.job_lock.busy:
+            self.lamp.set_state("idle")
+            self.status_label.setText(
+                f"Already busy: {self.state.job_owner}. Wait for "
+                "it to finish before renaming the film.")
+            return
+        name, ok = QInputDialog.getText(
+            self, "Rename film", "New name for the film:",
+            text=self.state.project_name())
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if name == self.state.project_name():
+            return
+        # Land any pending idea words in the film before it moves.
+        self._flush_idea()
+        try:
+            target = self.state.rename_project(name)
+        except HicksFieldError as exc:
+            self.lamp.set_state("error")
+            self.status_label.setText(exc.plain_text())
+            return
+        # The refresh above pruned the old folder from Recent
+        # films (it is gone); remember the film at its new folder.
+        self._remember_recent(target)
+        self.lamp.set_state("done")
+        self.status_label.setText(f"Renamed the film to {name}.")
+
+    def _delete_project(self):
+        if self.state.project_dir is None:
+            return
+        if self.state.job_lock.busy:
+            self.lamp.set_state("idle")
+            self.status_label.setText(
+                f"Already busy: {self.state.job_owner}. Wait for "
+                "it to finish before deleting the film.")
+            return
+        name = self.state.project_name()
+        answer = QMessageBox.question(
+            self, "Delete this film?",
+            f"Delete {name} for good? The film's folder and "
+            "everything in it (its scenes, pictures, spoken lines, "
+            "and the built film) will be removed. This cannot be "
+            "undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self.state.delete_project()
+        # The refresh prunes the deleted folder from Recent films
+        # on its own, the way it does for a folder removed outside
+        # the app.
+        self.lamp.set_state("done")
+        self.status_label.setText(f"Deleted {name}.")
+
     def _save_project(self):
         if self.state.project_dir is None:
             self._new_project()
@@ -1517,6 +1625,23 @@ class ScenesWindow(ModeWindow):
         # per arrival.
         self._incoming_shown = 0
         self._incoming_list_ready = False
+        # Streamed scenes repaint the list a few times a second,
+        # not per piece: a real model sends its answer in many
+        # small pieces, and work per piece made the window stutter
+        # while a breakdown streamed in. Arriving scenes and the
+        # progress line set the dirty flags; the timer does the
+        # repaint.
+        self._incoming_dirty = False
+        self._progress_note = None
+        self._incoming_timer = QTimer(self)
+        self._incoming_timer.setInterval(250)
+        self._incoming_timer.timeout.connect(self._flush_incoming)
+        # How many breakdowns have finished since the model check
+        # now running started: a check that lands after a breakdown
+        # must not overwrite the breakdown's own status line with
+        # its resting one.
+        self._breakdowns_finished = 0
+        self._check_breakdowns_finished = 0
         # True while the model check runs: Refresh stays disabled
         # until it lands, so a double-click cannot start two checks.
         self._checking_models = False
@@ -1672,7 +1797,9 @@ class ScenesWindow(ModeWindow):
         self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
         self._undo_shortcut.activated.connect(self._undo)
         self.add_button = DipButton("Add a scene")
-        self.add_button.setToolTip("Add an empty scene at the end.")
+        self.add_button.setToolTip(
+            "Add a scene at the end. Words typed in the boxes with "
+            "no scene chosen become the new scene.")
         self.add_button.clicked.connect(self._add_scene)
         edit_row.addWidget(self.add_button)
         self.remove_button = DipButton("Remove this scene")
@@ -1752,7 +1879,11 @@ class ScenesWindow(ModeWindow):
             # is cleared: clearing loads row -1, which must not
             # autosave the old words into a new scene.
             self._autosave_previous_project()
-            self._undo_stack.clear()
+            if self.state.project is not self._seen_project:
+                # A different film: the undo stack belongs to the
+                # old one. A rename keeps the same film (and its
+                # stack) and only moves its folder.
+                self._undo_stack.clear()
             self._seen_project = self.state.project
             self._seen_project_dir = self.state.project_dir
             self._loaded_row = -1
@@ -1799,8 +1930,17 @@ class ScenesWindow(ModeWindow):
         scene.prompt = prompt
         scene.narration = narration
         scene.motion = motion
-        if self._seen_project_dir is not None:
+        if old is self.state.project \
+                and self.state.project_dir is not None:
+            # The film was renamed, not switched: it is still the
+            # open film, in its new folder. Save it there.
+            scenes_mod.save_project(old, self.state.project_dir)
+        elif self._seen_project_dir is not None \
+                and self._seen_project_dir.exists():
             scenes_mod.save_project(old, self._seen_project_dir)
+        # Otherwise the old film is gone (it was deleted): saving
+        # would bring its folder back from the dead, so its words
+        # go with it.
 
     def _refresh_undo_button(self):
         """Undo is offered only when it can act: a snapshot on the
@@ -1957,6 +2097,26 @@ class ScenesWindow(ModeWindow):
                 self._incoming[self._incoming_shown],
                 row=self._incoming_shown)
             self._incoming_shown += 1
+        self._incoming_dirty = False
+
+    def _flush_incoming(self):
+        """Repaint what the stream brought in, a few times a
+        second at most: the throttle between the model's many
+        small pieces and the window, so it stays smooth while a
+        breakdown streams in. The scenes themselves are already
+        kept; only the showing is batched. When nothing is left
+        pending, the timer stops."""
+        if not self._breakdown_running:
+            self._incoming_timer.stop()
+            return
+        if self._incoming_dirty:
+            self._show_incoming()
+        if self._progress_note is not None:
+            note = self._progress_note
+            self._progress_note = None
+            self.show_status("working", note)
+        if not self._incoming_dirty and self._progress_note is None:
+            self._incoming_timer.stop()
 
     def _autosave_scene(self):
         """Write the edit boxes into the loaded scene, if they
@@ -2133,13 +2293,32 @@ class ScenesWindow(ModeWindow):
         self.show_status("done", f"Scene {row + 1} saved.")
 
     def _add_scene(self):
+        # Words typed while no scene is chosen belong to no scene
+        # yet: they become the new scene. Clearing them away while
+        # adding a blank one read as the app eating the user's
+        # words. Words typed over a chosen scene are that scene's
+        # edits, and the usual autosave keeps them there.
+        prompt = self.prompt_edit.toPlainText().strip()
+        narration = self.narration_edit.toPlainText().strip()
+        carried = self._loaded_row < 0 and bool(prompt or narration)
         self._push_undo()
-        self.state.project.scenes.append(scenes_mod.Scene())
+        if carried:
+            self.state.project.scenes.append(scenes_mod.Scene(
+                prompt=prompt,
+                narration=narration,
+                motion=self.motion_combo.currentData() or ""))
+        else:
+            self.state.project.scenes.append(scenes_mod.Scene())
         self.state.save()
         self.state.project_changed.emit()
         self.scene_list.setCurrentRow(len(self.state.project.scenes) - 1)
         self.prompt_edit.setFocus()
-        self.show_status("idle", "New scene. Type what the picture shows.")
+        if carried:
+            self.show_status(
+                "done", "New scene, made from the words you typed.")
+        else:
+            self.show_status(
+                "idle", "New scene. Type what the picture shows.")
 
     def _remove_scene(self):
         row = self.scene_list.currentRow()
@@ -2180,6 +2359,7 @@ class ScenesWindow(ModeWindow):
         if self._checking_models or self._breakdown_running:
             return
         self._checking_models = True
+        self._check_breakdowns_finished = self._breakdowns_finished
         self.refresh_button.setEnabled(False)
         self._update_break_button()
         self.show_status("working", "Checking for Ollama.")
@@ -2228,6 +2408,13 @@ class ScenesWindow(ModeWindow):
         return infos
 
     def _on_models_progress(self, label, fraction, detail):
+        # The status writes below are the check talking, and a
+        # breakdown that finished while this check was running has
+        # already had the last word: the progress lines land all
+        # through the check, so they get the same guard as its
+        # ending (see _on_models). The picker still fills.
+        status_is_stale = (self._breakdowns_finished
+                           != self._check_breakdowns_finished)
         if label == "names":
             # The names are in: fill the picker now, before any
             # capability is known, so the window is usable while
@@ -2245,7 +2432,8 @@ class ScenesWindow(ModeWindow):
                     [info["name"] for info in infos])
                 self.model_combo.setCurrentIndex(-1)
                 self._update_break_button()
-            self.show_status("working", "Checking models.")
+            if not status_is_stale:
+                self.show_status("working", "Checking models.")
             return
         if label == "model":
             # One model's details landed: keep them, and if that
@@ -2262,11 +2450,16 @@ class ScenesWindow(ModeWindow):
                         self._model_note_text(data["name"], info))
             return
         if label == "models":
-            self.show_status("working",
-                             f"Checking models. {detail}")
+            if not status_is_stale:
+                self.show_status("working",
+                                 f"Checking models. {detail}")
 
     def _on_models(self, infos):
-        self._worker = None
+        # The worker slot may already hold a breakdown that started
+        # while this check was running: only the check's own worker
+        # is finished here.
+        if not self._breakdown_running:
+            self._worker = None
         self._checking_models = False
         self.refresh_button.setEnabled(True)
         self._ollama_ok = True
@@ -2285,14 +2478,22 @@ class ScenesWindow(ModeWindow):
         else:
             self.model_combo.setCurrentIndex(-1)
         self._update_break_button()
+        # A breakdown that finished while this check was running
+        # already left its own word on the status line (made,
+        # stopped, went to another film): the check's resting line
+        # must not overwrite it. The picker still fills either way.
+        status_is_stale = (self._breakdowns_finished
+                           != self._check_breakdowns_finished)
         if infos:
             if not (picked and picked in names):
                 self._show_model_recommendation()
-            self.show_status(
-                "done",
-                f"Ollama is running with {plural(len(infos), 'model')}. "
-                "Pick one, then break the idea into scenes.")
-        else:
+            if not status_is_stale:
+                self.show_status(
+                    "done",
+                    f"Ollama is running with "
+                    f"{plural(len(infos), 'model')}. "
+                    "Pick one, then break the idea into scenes.")
+        elif not status_is_stale:
             self.show_status(
                 "idle",
                 "Ollama is running but has no models. Pull one first, "
@@ -2357,7 +2558,8 @@ class ScenesWindow(ModeWindow):
         return ""
 
     def _on_models_error(self, exc):
-        self._worker = None
+        if not self._breakdown_running:
+            self._worker = None
         self._checking_models = False
         self.refresh_button.setEnabled(True)
         self._ollama_ok = False
@@ -2366,6 +2568,11 @@ class ScenesWindow(ModeWindow):
         self._update_break_button()
         self.ollama_label.setText(
             "Ollama is not running. Scenes can be typed by hand below.")
+        if (self._breakdowns_finished
+                != self._check_breakdowns_finished):
+            # A breakdown finished while this check ran and left
+            # its own word on the status line: keep it.
+            return
         if isinstance(exc, OllamaUnreachableError):
             self.show_status("idle", exc.plain_text())
         else:
@@ -2426,6 +2633,8 @@ class ScenesWindow(ModeWindow):
         self._incoming = []
         self._incoming_shown = 0
         self._incoming_list_ready = False
+        self._incoming_dirty = False
+        self._progress_note = None
         self._set_breakdown_ui(True)
         self._refresh()
         self.show_status("working", "Breaking the idea into scenes.")
@@ -2501,7 +2710,11 @@ class ScenesWindow(ModeWindow):
             self._incoming.append(scenes_mod.Scene(
                 prompt=data.get("prompt", ""),
                 narration=data.get("narration", "")))
-            self._show_incoming()
+            # Not a repaint per piece: the timer flushes a few
+            # times a second, however many pieces landed meanwhile.
+            self._incoming_dirty = True
+            if not self._incoming_timer.isActive():
+                self._incoming_timer.start()
             return
         if label == "loading":
             # Still waiting for the first headers: the model is
@@ -2510,12 +2723,25 @@ class ScenesWindow(ModeWindow):
                 "working",
                 f"Ollama is still loading the model {detail}.")
             return
-        self.show_status(
-            "working",
-            f"Breaking the idea into scenes. {detail}")
+        # The stream reports progress for every small piece it
+        # receives: keep the latest words and let the timer put
+        # them on the status line a few times a second, instead of
+        # relaying out the window per piece.
+        self._progress_note = f"Breaking the idea into scenes. {detail}"
+        if not self._incoming_timer.isActive():
+            self._incoming_timer.start()
 
     def _commit_incoming(self):
+        self._incoming_timer.stop()
+        # A progress note still pending dies here: the finish
+        # status below replaces it.
+        self._progress_note = None
+        if self._incoming_dirty:
+            # The last pieces may not have been shown yet: show
+            # them before the commit swaps the list.
+            self._show_incoming()
         self._breakdown_running = False
+        self._breakdowns_finished += 1
         self._set_breakdown_ui(False)
         # The breakdown replaces the whole scene list: the boxes
         # belong to the old list, so forget them before the swap, or
@@ -2545,6 +2771,26 @@ class ScenesWindow(ModeWindow):
         self._incoming = []
         self._load_scene(self.scene_list.currentRow())
 
+    def _discard_incoming(self):
+        """End a cancelled breakdown without touching the film.
+        The scenes that arrived live only in memory until a finish
+        commits them, so dropping them leaves the film's scenes
+        exactly as they were when the breakdown started: Cancel
+        means stop and keep what was there, like everywhere else
+        in the app, and never depends on the user finding Undo."""
+        self._incoming_timer.stop()
+        self._incoming_dirty = False
+        self._progress_note = None
+        self._breakdown_running = False
+        self._breakdowns_finished += 1
+        self._set_breakdown_ui(False)
+        self._loaded_row = -1
+        self._incoming = []
+        self._incoming_shown = 0
+        self._incoming_list_ready = False
+        self._refresh()
+        self._load_scene(self.scene_list.currentRow())
+
     def _save_incoming_to_original(self):
         """Save a finished breakdown into the film it started in,
         after the user switched films while it ran. The film is
@@ -2561,11 +2807,19 @@ class ScenesWindow(ModeWindow):
             except Exception:  # noqa: BLE001 - the note below covers it
                 saved = None
         if saved is not None:
+            # The name the user knows the film by, never its folder:
+            # a second film with the same name gets a "-2" folder,
+            # and a message naming that folder points at a name
+            # shown nowhere else. A film with no real name yet is
+            # known by its folder, the way the windows show it.
+            name = saved.name.strip()
+            if not name or name.lower() == "untitled film":
+                name = target_dir.name
             saved.scenes = list(self._incoming)
             scenes_mod.save_project(saved, target_dir)
             return (
                 f"The film changed while the breakdown ran. The "
-                f"{count} went to {target_dir.name}, the film they "
+                f"{count} went to {name}, the film they "
                 "were made for.")
         return (
             f"The film changed while the breakdown ran, so the "
@@ -2588,21 +2842,20 @@ class ScenesWindow(ModeWindow):
     def _on_breakdown_error(self, exc):
         self._worker = None
         if isinstance(exc, CancelledError):
-            kept = len(self._incoming)
-            self._commit_incoming()
-            if self._breakdown_note is not None:
-                self.show_status(
-                    "idle", f"Stopped. {self._breakdown_note}")
-            elif kept:
-                self.show_status(
-                    "idle",
-                    f"Stopped. Kept the {plural(kept, 'scene')} made "
-                    "so far.")
-            else:
-                self.show_status(
-                    "idle", "Stopped. Kept the current scenes.")
+            # A cancel commits nothing, however many scenes had
+            # arrived: the film keeps the scenes it started with,
+            # and the status says the breakdown stopped, even when
+            # no scene had arrived yet.
+            self._discard_incoming()
+            self.show_status(
+                "idle",
+                "Stopped. The scenes were left as they were.")
             return
+        self._incoming_timer.stop()
+        self._incoming_dirty = False
+        self._progress_note = None
         self._breakdown_running = False
+        self._breakdowns_finished += 1
         self._set_breakdown_ui(False)
         self._incoming = []
         self._refresh()
@@ -2749,11 +3002,14 @@ class StillsWindow(ModeWindow):
         splitter = QSplitter(Qt.Horizontal)
         self.still_list = QListWidget()
         self.still_list.setIconSize(QSize(96, 96))
-        # Three whole rows of 96 px thumbnails. Measured live: each
-        # row is 115 px (96 icon + 19 list margins), so three rows
-        # need 345 px of viewport; 350 covers the frame plus a
-        # little slack for platform rounding.
-        self.still_list.setMinimumHeight(350)
+        # Two whole rows of 96 px thumbnails. Measured live: each
+        # row is 115 px (96 icon + 19 list margins), so two rows
+        # need 230 px of viewport. Three rows (350) made the
+        # window's minimum height 733, taller than the 728 px a
+        # 768-tall screen leaves above its panel, and the status
+        # line sat under the panel; the list scrolls for the rest,
+        # like the other windows.
+        self.still_list.setMinimumHeight(230)
         self.still_list.setToolTip(
             "Pick a picture to see it large on the right.")
         self.still_list.currentRowChanged.connect(self._show_preview)

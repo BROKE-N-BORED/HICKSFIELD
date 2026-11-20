@@ -44,10 +44,10 @@ def make_tarball(top, files):
 
 def release_payload(**overrides):
     payload = {
-        "tag_name": "v0.7.0",
+        "tag_name": "v0.8.0",
         "target_commitish": SHA,
         "tarball_url": "http://127.0.0.1:1/tarball",
-        "html_url": "https://github.com/BROKE-N-BORED/HICKSFIELD/releases/tag/v0.7.0",
+        "html_url": "https://github.com/BROKE-N-BORED/HICKSFIELD/releases/tag/v0.8.0",
         "body": "The update release.",
         "draft": False,
         "prerelease": False,
@@ -142,7 +142,7 @@ class CheckTests(FakeServerTestCase):
     def test_newer_release(self):
         result = updates.check_for_update("0.5.0", url=self.api_url())
         self.assertEqual(result["state"], "newer")
-        self.assertEqual(result["latest"], "0.7.0")
+        self.assertEqual(result["latest"], "0.8.0")
         self.assertEqual(result["sha"], SHA)
         self.assertEqual(result["tarball_url"], self.tarball_url())
         self.assertIn("update release", result["body"])
@@ -155,7 +155,7 @@ class CheckTests(FakeServerTestCase):
         self.assertEqual(result["latest"], "0.5.0")
 
     def test_dev_tree_newer_than_release_is_current(self):
-        result = updates.check_for_update("0.7.0", url=self.api_url())
+        result = updates.check_for_update("0.8.0", url=self.api_url())
         self.assertEqual(result["state"], "current")
 
     def test_tag_without_v_prefix(self):
@@ -243,7 +243,7 @@ class VerifyTests(TempEnvTestCase):
 
     def _good_files(self):
         return {
-            "hicksfield/__init__.py": "__version__ = \"0.6.0\"\n",
+            "hicksfield/__init__.py": "__version__ = \"0.7.0\"\n",
             "hicksfield/__main__.py": "",
             "run.sh": "#!/bin/sh\n",
             "installer.py": "",
@@ -325,7 +325,7 @@ class InstallTests(FakeServerTestCase):
         shutil.copytree(TREE / "hicksfield", root / "hicksfield")
         shutil.copy(TREE / "run.sh", root / "run.sh")
         shutil.copy(TREE / "installer.py", root / "installer.py")
-        (root / "OLDFILE.txt").write_text("dropped in 0.7.0\n")
+        (root / "OLDFILE.txt").write_text("dropped in 0.8.0\n")
         venv_bin = root / "venv" / "bin"
         venv_bin.mkdir(parents=True)
         (venv_bin / "python").symlink_to(sys.executable)
@@ -336,11 +336,11 @@ class InstallTests(FakeServerTestCase):
         main = (TREE / "hicksfield" / "__main__.py").read_text()
         return {
             "hicksfield/__init__.py":
-                "\"\"\"HicksField.\"\"\"\n\n__version__ = \"0.7.0\"\n",
+                "\"\"\"HicksField.\"\"\"\n\n__version__ = \"0.8.0\"\n",
             "hicksfield/__main__.py": main,
             "run.sh": (TREE / "run.sh").read_text(),
             "installer.py": (TREE / "installer.py").read_text(),
-            "NEWFILE.txt": "new in 0.7.0\n",
+            "NEWFILE.txt": "new in 0.8.0\n",
         }
 
     def test_install_replaces_tree_and_keeps_venv(self):
@@ -348,10 +348,10 @@ class InstallTests(FakeServerTestCase):
         tarball = self.tmp / "update.tar.gz"
         tarball.write_bytes(
             make_tarball(TOP, self._new_tree_files()))
-        version = updates.install_update(tarball, SHA, "0.7.0",
+        version = updates.install_update(tarball, SHA, "0.8.0",
                                          root=root)
-        self.assertEqual(version, "0.7.0")
-        self.assertIn("__version__ = \"0.7.0\"",
+        self.assertEqual(version, "0.8.0")
+        self.assertIn("__version__ = \"0.8.0\"",
                       (root / "hicksfield" / "__init__.py").read_text())
         self.assertTrue((root / "NEWFILE.txt").exists())
         self.assertFalse((root / "OLDFILE.txt").exists())
@@ -368,7 +368,7 @@ class InstallTests(FakeServerTestCase):
             make_tarball(other, self._new_tree_files()))
         before = (root / "hicksfield" / "__init__.py").read_text()
         with self.assertRaises(HicksFieldError) as caught:
-            updates.install_update(tarball, SHA, "0.7.0", root=root)
+            updates.install_update(tarball, SHA, "0.8.0", root=root)
         self.assertIn("did not match the release",
                       str(caught.exception))
         self.assertEqual(
@@ -384,7 +384,7 @@ class InstallTests(FakeServerTestCase):
         tarball.write_bytes(
             make_tarball(TOP, self._new_tree_files()))
         with self.assertRaises(HicksFieldError) as caught:
-            updates.install_update(tarball, SHA, "0.7.0", root=root)
+            updates.install_update(tarball, SHA, "0.8.0", root=root)
         self.assertIn("not installed with the installer",
                       str(caught.exception))
         self.assertFalse((root / "NEWFILE.txt").exists())
@@ -401,8 +401,8 @@ class InstallTests(FakeServerTestCase):
         self.assertGreater(dest.stat().st_size, 0)
         version = updates.install_update(dest, result["sha"],
                                          result["latest"], root=root)
-        self.assertEqual(version, "0.7.0")
-        self.assertIn("__version__ = \"0.7.0\"",
+        self.assertEqual(version, "0.8.0")
+        self.assertIn("__version__ = \"0.8.0\"",
                       (root / "hicksfield" / "__init__.py").read_text())
 
     def test_restart_replaces_the_process_with_the_app(self):
@@ -501,12 +501,12 @@ class GuiWiringTests(FakeServerTestCase):
         from tests.helpers import wait_for
 
         FakeGitHubHandler.payload = release_payload(
-            tag_name="v0.6.0", tarball_url=self.tarball_url())
+            tag_name="v0.7.0", tarball_url=self.tarball_url())
         self.main.show()
         self.assertTrue(self._wait_idle())
         self.main._on_check_updates()
         self.assertTrue(wait_for(
-            lambda: "You have the latest version (0.6.0)."
+            lambda: "You have the latest version (0.7.0)."
             in self.main.status_label.text(),
             timeout_ms=10000))
 
@@ -518,12 +518,12 @@ class GuiWiringTests(FakeServerTestCase):
         self.main.show()
         self.assertTrue(self._wait_idle())
         self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0]["latest"], "0.7.0")
+        self.assertEqual(seen[0]["latest"], "0.8.0")
         seen.clear()
         self.main._on_check_updates()
         self.assertTrue(wait_for(lambda: len(seen) == 1,
                                  timeout_ms=10000))
-        self.assertEqual(seen[0]["latest"], "0.7.0")
+        self.assertEqual(seen[0]["latest"], "0.8.0")
 
     def test_startup_check_off_makes_no_request(self):
         from hicksfield.gui import settings

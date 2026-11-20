@@ -192,10 +192,16 @@ class StreamingTests(TempEnvTestCase):
 
 class Item3Tests(GuiBase):
     def test_stills_default_size_and_whole_rows(self):
+        # List 6 item 5 supersedes the three-row minimum: the
+        # window has to fit a 768-tall screen with a panel, so the
+        # list now guarantees two whole 115 px rows (230 px) and
+        # scrolls for the rest. Three rows made the minimum height
+        # 733 and put the status line under the panel.
         window = self._show(StillsWindow)
         self.assertEqual(window._default_size, (950, 700))
-        # Three whole rows of 115 px rows need 345 px of viewport.
-        self.assertGreaterEqual(window.still_list.minimumHeight(), 347)
+        self.assertGreaterEqual(window.still_list.minimumHeight(),
+                                230)
+        self.assertLess(window.minimumSizeHint().height(), 728)
 
     def test_scenes_default_height_raised(self):
         window = self._show(ScenesWindow)
@@ -309,8 +315,18 @@ class Item5Tests(GuiBase):
         self.assertIn("Made 2 scenes",
                       window.status_label.text())
 
-    def test_breakdown_cancel_keeps_partial_scenes(self):
+    def test_breakdown_cancel_keeps_the_original_scenes(self):
+        # Item 1 of list 6: a cancel commits nothing. The film
+        # starts with two hand scenes; one breakdown scene arrives;
+        # the cancel must leave the two hand scenes, in the window
+        # and on disk, and say the scenes were left as they were.
         import threading
+        from PySide6.QtWidgets import QMessageBox
+        self.state.project.scenes = [
+            scenes_mod.Scene(prompt="hand one", narration="One."),
+            scenes_mod.Scene(prompt="hand two", narration="Two."),
+        ]
+        self.state.save()
         window = self._ready_window()
         started = threading.Event()
 
@@ -326,22 +342,64 @@ class Item5Tests(GuiBase):
             raise CancelledError()
 
         with mock.patch.object(
-                ollama, "break_into_scenes_streaming",
-                side_effect=_run):
+                QMessageBox, "question",
+                return_value=QMessageBox.Yes), \
+                mock.patch.object(
+                    ollama, "break_into_scenes_streaming",
+                    side_effect=_run):
             window._break_into_scenes()
             self.assertTrue(started.wait(5))
-            # Skeletons show while the breakdown is still coming.
-            skeleton = sum(
-                1 for row in range(window.scene_list.count())
-                if window.scene_list.item(row).flags()
-                == Qt.NoItemFlags)
-            self.assertEqual(skeleton, 3)
+            # Skeletons show while the breakdown is still coming
+            # (the list repaints a few times a second, so wait for
+            # the flush instead of looking at once).
+            self.assertTrue(wait_for(
+                lambda: sum(
+                    1 for row in range(window.scene_list.count())
+                    if window.scene_list.item(row).flags()
+                    == Qt.NoItemFlags) == 3, 5000))
             self.assertTrue(window.breakdown_cancel.isVisible())
             QTest.mouseClick(window.breakdown_cancel, Qt.LeftButton)
             self.assertTrue(wait_for(
                 lambda: not window._breakdown_running, 5000))
-        self.assertEqual(len(self.state.project.scenes), 1)
-        self.assertIn("Kept the 1 scene",
+        self.assertEqual(
+            [scene.prompt for scene in self.state.project.scenes],
+            ["hand one", "hand two"])
+        on_disk = scenes_mod.load_project(self.state.project_dir)
+        self.assertEqual(
+            [scene.prompt for scene in on_disk.scenes],
+            ["hand one", "hand two"])
+        self.assertIn("Stopped.", window.status_label.text())
+        self.assertIn("left as they were",
+                      window.status_label.text())
+
+    def test_breakdown_cancel_before_any_scene_still_reports(self):
+        # Item 3 of list 6: with no scene arrived yet, the cancel
+        # still leaves a stopped message, not the resting line.
+        import threading
+        window = self._ready_window()
+        started = threading.Event()
+
+        def _run(idea, model, on_scene, report=None,
+                 cancel_event=None, timeout=180, scene_length="medium"):
+            started.set()
+            deadline = time.monotonic() + 10
+            while not cancel_event.is_set():
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+            raise CancelledError()
+
+        with mock.patch.object(
+                ollama, "break_into_scenes_streaming",
+                side_effect=_run):
+            window._break_into_scenes()
+            self.assertTrue(started.wait(5))
+            QTest.mouseClick(window.breakdown_cancel, Qt.LeftButton)
+            self.assertTrue(wait_for(
+                lambda: not window._breakdown_running, 5000))
+        self.assertEqual(self.state.project.scenes, [])
+        self.assertIn("Stopped.", window.status_label.text())
+        self.assertIn("left as they were",
                       window.status_label.text())
 
     def test_replace_declined_keeps_scenes(self):
@@ -956,7 +1014,7 @@ class Item20Tests(GuiBase):
 class VersionTests(unittest.TestCase):
     def test_version_is_0_5_0(self):
         from hicksfield import __version__
-        self.assertEqual(__version__, "0.6.0")
+        self.assertEqual(__version__, "0.7.0")
 
 
 if __name__ == "__main__":

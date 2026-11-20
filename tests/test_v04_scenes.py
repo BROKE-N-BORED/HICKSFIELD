@@ -346,5 +346,48 @@ class Item46UndoButtonStateTests(GuiBase):
         self.assertFalse(window.undo_button.isEnabled())
 
 
+class List6AddSceneTests(GuiBase):
+    """List 6 item 4: words typed with no scene chosen become
+    the new scene when Add is pressed, instead of being cleared
+    away; words typed over a chosen scene stay that scene's
+    edits."""
+
+    def test_add_starts_from_typed_words(self):
+        self.state.project.scenes = [
+            scenes_mod.Scene(prompt="a stool",
+                             narration="A stool sits here.")]
+        self.state.project_changed.emit()
+        window = self._show(ScenesWindow)
+        # Nothing chosen: the boxes hold no scene's words.
+        window.scene_list.setCurrentRow(-1)
+        self.assertEqual(window._loaded_row, -1)
+        window.prompt_edit.setPlainText("a red door")
+        window.narration_edit.setPlainText("The door is red.")
+        window._add_scene()
+        self.assertEqual(len(self.state.project.scenes), 2)
+        added = self.state.project.scenes[1]
+        self.assertEqual(added.prompt, "a red door")
+        self.assertEqual(added.narration, "The door is red.")
+        on_disk = scenes_mod.load_project(self.state.project_dir)
+        self.assertEqual(on_disk.scenes[1].prompt, "a red door")
+        self.assertIn("made from the words you typed",
+                      window.status_label.text())
+
+    def test_add_with_a_chosen_scene_keeps_its_edits_there(self):
+        self.state.project.scenes = [
+            scenes_mod.Scene(prompt="a stool",
+                             narration="A stool sits here.")]
+        self.state.project_changed.emit()
+        window = self._show(ScenesWindow)
+        window.scene_list.setCurrentRow(0)
+        window.prompt_edit.setPlainText("a changed stool")
+        window._add_scene()
+        # The edit stayed with the chosen scene (the autosave on
+        # the row switch), and the new scene starts blank.
+        self.assertEqual(self.state.project.scenes[0].prompt,
+                         "a changed stool")
+        self.assertEqual(self.state.project.scenes[1].prompt, "")
+
+
 if __name__ == "__main__":
     unittest.main()

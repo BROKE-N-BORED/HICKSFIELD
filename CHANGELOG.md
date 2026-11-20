@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.7.0 (2026-11-19)
+
+The full sixth task list (task list 6, items 1-7): a cancel
+that replaced a film's scenes, a status that named a folder
+instead of a film, words lost on the way to a new scene, the
+Stills window's height, film housekeeping, and a smoother
+breakdown.
+
+- Cancelling a scene breakdown no longer replaces the film's
+  scenes with the partial set. However many scenes had arrived,
+  a cancel keeps the scenes the film started with, and the
+  status says so: "Stopped. The scenes were left as they
+  were." That message now shows even when no scene had arrived
+  yet, and a model check finishing late can no longer overwrite
+  it with the resting line.
+- When a breakdown lands in its own film after a switch, the
+  status names the film by its name, never by its folder.
+- Pressing "Add a scene" with words typed in the boxes and no
+  scene chosen now makes the new scene from those words
+  instead of clearing them away.
+- The Stills window fits a 768-tall screen with a panel: its
+  picture list needs less height and scrolls for the rest, so
+  the status line stays in sight, like the other windows.
+- Films can be renamed and deleted inside the app, from the
+  File menu next to Open film. Rename asks for the new name,
+  moves the film's folder, and keeps the film open under its
+  new name; a name another film's folder already holds is
+  refused plainly. Delete asks first (No is the default),
+  names the film, and says it cannot be undone. Both wait for
+  a running job to finish first.
+- The scene list now repaints a few times a second while a
+  breakdown streams in, instead of once per small piece, so
+  the window stays smooth while the scenes arrive.
+
 ## 0.6.0 (2026-11-19)
 
 The full fifth task list (task list 5, items 1-26): the voice
